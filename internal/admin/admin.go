@@ -666,6 +666,7 @@ func (h *Handler) configUpdate(w http.ResponseWriter, r *http.Request) {
 		Failover          *bool              `json:"failover"`
 		KeepaliveSec      *int               `json:"keepalive_sec"`
 		Aliases           *map[string]string `json:"aliases"`
+		AliasNotes        *map[string]string `json:"alias_notes"`
 		HiddenModels      *[]string          `json:"hidden_models"`
 		NewPassword       string             `json:"new_password"`
 	}
@@ -714,6 +715,17 @@ func (h *Handler) configUpdate(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		c.Aliases = m
+	}
+	if in.AliasNotes != nil {
+		m := map[string]string{}
+		for k, v := range *in.AliasNotes {
+			k = strings.ToLower(strings.TrimSpace(k))
+			// 别名已删掉时，备注跟着消失，别留孤儿键
+			if _, ok := c.Aliases[k]; ok && strings.TrimSpace(v) != "" {
+				m[k] = strings.TrimSpace(v)
+			}
+		}
+		c.AliasNotes = m
 	}
 	if in.HiddenModels != nil {
 		c.HiddenModels = *in.HiddenModels

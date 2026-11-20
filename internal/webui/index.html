@@ -1011,57 +1011,141 @@ async function sampleCost(btn) {
   if (btn) { btn.disabled = false; btn.textContent = old; }
 }
 
-/* ══ 模型与别名 ═══════════════════════════════════════════════════ */
-function viewModels() {
-  const cat = (S.catalog && S.catalog.status) || {};
-  const models = S.models || [];
+/* ══ 模型与别名 ═══════════════════════════════════════════════════
+   三块：新增别名（表单）→ 别名表（可删）→ 内置模型（可隐藏）。
+   写入都走 POST /admin/api/config 的局部字段，不新增接口。 */
+function aliasState() {
   const aliases = (S.config && S.config.aliases) || {};
+  const notes = (S.config && S.config.alias_notes) || {};
+  const hidden = new Set((S.config && S.config.hidden_models) || []);
+  const models = S.models || [];
+  const upstream = models.filter((m) => !aliases[m.id]).map((m) => m.id);
   const usage = {};
   (S.accounts || []).forEach((a) => Object.entries((a.cost && a.cost.per_model) || {}).forEach(([m, v]) => {
     usage[m] = (usage[m] || 0) + (v.tokens || 0);
   }));
-  const aliasTargets = new Set(Object.values(aliases));
+  return { aliases, notes, hidden, models, upstream, usage };
+}
+
+function viewModels() {
+  const st = aliasState();
+  const cat = (S.catalog && S.catalog.status) || {};
+  const aliasRows = Object.entries(st.aliases);
+  // 隐藏的模型不在 state.models 里（catalog.List 已过滤），单独补出来才能取消隐藏
+  const hiddenRows = [...st.hidden].filter((id) => !st.aliases[id]).map((id) => ({ id, hidden: true }));
+  const visibleRows = st.models.filter((m) => !st.aliases[m.id]).map((m) => ({ id: m.id, hidden: false }));
+  const modelRows = visibleRows.concat(hiddenRows);
 
   return `
   <div class="box">
-    <header><h3>模型目录<span class="hint">上游 compatible-mode 实时同步</span></h3>
+    <header><h3>新增别名<span class="hint">请求名 → 上游模型</span></h3>
+      <span class="grow"></span><span class="note">请求名不区分大小写</span></header>
+    <div class="pad">
+      <div style="display:grid;grid-template-columns:minmax(160px,1fr) minmax(180px,1.2fr) minmax(120px,.8fr) auto;gap:10px;align-items:end">
+        <label class="fld" style="margin:0"><span class="lb">客户端请求名</span>
+          <input id="alName" type="text" class="mono" placeholder="例如 qwen"></label>
+        <label class="fld" style="margin:0"><span class="lb">指向模型</span>
+          <select id="alTarget" class="mono">${st.upstream.length
+            ? st.upstream.map((id) => `<option value="${esc(id)}">${esc(id)}</option>`).join("")
+            : `<option value="">（目录为空，先同步）</option>`}</select></label>
+        <label class="fld" style="margin:0"><span class="lb">备注<span class="hint">（可选）</span></span>
+          <input id="alNote" type="text" placeholder="例如 客户端默认"></label>
+        <button class="primary" onclick="addAlias(this)" ${st.upstream.length ? "" : "disabled"}>添加</button>
+      </div>
+      <div class="hint" style="margin-top:10px">别名优先于上游模型名解析：客户端请求 <code class="inline">qwen</code> 时网关直接换成右侧模型，上游看到的只有真实模型名。</div>
+    </div>
+  </div>
+
+  <div class="box">
+    <header><h3>别名</h3><span class="grow"></span><span class="note">${aliasRows.length} 条</span></header>
+    <div class="tbl-wrap">
+      <table class="acc" style="min-width:720px">
+        <thead><tr><th>请求名</th><th>指向模型</th><th>上游是否存在</th><th class="opt">本机用量</th><th>备注</th><th class="ops"></th></tr></thead>
+        <tbody>${aliasRows.length ? aliasRows.map(([k, v]) => `
+          <tr>
+            <td class="mono nw">${esc(k)}</td>
+            <td class="mono nw">${esc(v)}</td>
+            <td>${st.models.some((m) => m.id === v) || st.hidden.has(v)
+              ? '<span class="tag ok">是</span>'
+              : '<span class="tag bad">否 · 请求会 404</span>'}</td>
+            <td class="num opt">${st.usage[v] ? nf(st.usage[v]) : "—"}</td>
+            <td class="hint">${esc(st.notes[k] || "—")}</td>
+            <td class="ops"><button class="xs ghost danger" onclick="delAlias('${esc(k)}')">删除</button></td>
+          </tr>`).join("") : emptyRow(6, "还没有别名", "在上面的表单里填一个请求名，选一个上游模型")}
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="box">
+    <header><h3>内置模型<span class="hint">勾「隐藏」后 /v1/models 与别名下拉里都不再出现</span></h3>
       <span class="grow"></span>
       <span class="note">${(cat.count || 0) === 0 ? "尚未同步" : (cat.source === "stale" ? "过期缓存" : "实时同步") + " · " + cat.count + " 个 · " + ago(cat.fetched_at)}</span>
       <button class="xs" onclick="refreshCatalog(this)">同步</button>
     </header>
     <div class="tbl-wrap">
-      <table class="acc" style="min-width:780px">
-        <thead><tr><th>模型 ID</th><th>类型</th><th>本机 token 用量</th><th>说明</th></tr></thead>
-        <tbody>${models.length ? models.map((m) => {
-          const target = aliases[m.id];
-          const tok = usage[target || m.id];
-          return `<tr>
-            <td class="mono nw">${esc(m.id)}</td>
-            <td>${target ? `<span class="tag hl">别名 → ${esc(target)}</span>` : `<span class="tag mute">上游模型</span>`}</td>
-            <td class="num">${tok ? nf(tok) : "—"}</td>
-            <td class="hint" style="white-space:normal;max-width:280px">${esc(m.description || (aliasTargets.has(m.id) ? "被别名指向" : "—"))}</td>
-          </tr>`;
-        }).join("") : emptyRow(4, "目录为空", "至少需要一个可用凭证才能同步上游模型")}
+      <table class="acc" style="min-width:560px">
+        <thead><tr><th>模型 ID</th><th class="opt">本机用量</th><th style="width:88px">隐藏</th></tr></thead>
+        <tbody>${modelRows.length ? modelRows.map((m) => `
+          <tr>
+            <td class="mono nw">${esc(m.id)}${m.hidden ? ' <span class="tag mute">已隐藏</span>' : ""}</td>
+            <td class="num opt">${st.usage[m.id] ? nf(st.usage[m.id]) : "—"}</td>
+            <td><input type="checkbox" ${m.hidden ? "checked" : ""} onchange="toggleHidden('${esc(m.id)}',this.checked)" style="width:auto"></td>
+          </tr>`).join("") : emptyRow(3, "目录为空", "至少需要一个可用凭证才能同步上游模型")}
         </tbody>
       </table>
     </div>
     ${cat.error ? `<div class="foot"><span class="hint" style="color:var(--bad)">${esc(cat.error)}</span></div>` : ""}
-  </div>
-
-  <div class="box">
-    <header><h3>别名映射<span class="hint">客户端可直接用别名请求</span></h3>
-      <span class="grow"></span><span class="note">${Object.keys(aliases).length} 条 · 在「配置」页编辑</span></header>
-    <div class="tbl-wrap">
-      <table class="acc" style="min-width:520px">
-        <thead><tr><th>别名</th><th>指向</th><th>上游是否存在</th></tr></thead>
-        <tbody>${Object.keys(aliases).length ? Object.entries(aliases).map(([k, v]) => `
-          <tr><td class="mono">${esc(k)}</td><td class="mono">${esc(v)}</td>
-            <td>${models.some((m) => m.id === v) ? '<span class="tag ok">是</span>' : '<span class="tag bad">否 · 会 404</span>'}</td></tr>`).join("")
-          : emptyRow(3, "没有别名", "在「配置」页按 别名=上游模型ID 逐行填写")}
-        </tbody>
-      </table>
-    </div>
   </div>`;
+}
+
+/* 统一的别名/隐藏写入：只提交变化的字段，别把整份 config 覆盖回去 */
+async function saveAliasState(aliases, notes, okMsg) {
+  const r = await api("/admin/api/config", { method: "POST", body: JSON.stringify({ aliases, alias_notes: notes }) });
+  if (!r.ok) { toast(r.error || "保存失败", "bad"); return false; }
+  await load(true);
+  if (okMsg) toast(okMsg);
+  return true;
+}
+
+async function addAlias(btn) {
+  const name = ($("#alName").value || "").trim().toLowerCase();
+  const target = ($("#alTarget").value || "").trim();
+  const note = ($("#alNote").value || "").trim();
+  if (!name) { toast("请填客户端请求名", "bad"); return; }
+  if (!/^[a-z0-9][a-z0-9._-]*$/.test(name)) { toast("请求名只能用字母/数字和 . _ -，且以字母或数字开头", "bad"); return; }
+  if (!target) { toast("没有可选的上游模型，先同步目录", "bad"); return; }
+  const st = aliasState();
+  if (st.aliases[name]) { toast("别名 " + name + " 已存在，先删掉再改", "bad"); return; }
+  if (st.models.some((m) => m.id === name) || st.hidden.has(name)) {
+    toast("请求名与内置模型同名，会盖掉真实模型", "bad"); return;
+  }
+  if (btn) { btn.disabled = true; btn.textContent = "保存中"; }
+  const aliases = Object.assign({}, st.aliases, { [name]: target });
+  const notes = Object.assign({}, st.notes);
+  if (note) notes[name] = note;
+  await saveAliasState(aliases, notes, "已添加别名 " + name + " → " + target);
+  if (btn) { btn.disabled = false; btn.textContent = "添加"; }
+}
+
+async function delAlias(name) {
+  if (!confirm("删除别名「" + name + "」？\n之后客户端再用这个请求名会直接透传给上游。")) return;
+  const st = aliasState();
+  const aliases = Object.assign({}, st.aliases);
+  delete aliases[name];
+  const notes = Object.assign({}, st.notes);
+  delete notes[name];
+  await saveAliasState(aliases, notes, "已删除别名 " + name);
+}
+
+async function toggleHidden(id, hide) {
+  const st = aliasState();
+  const list = new Set(st.hidden);
+  if (hide) list.add(id); else list.delete(id);
+  const r = await api("/admin/api/config", { method: "POST", body: JSON.stringify({ hidden_models: [...list] }) });
+  if (!r.ok) { toast(r.error || "保存失败", "bad"); return; }
+  await load(true);
+  toast(hide ? "已隐藏 " + id : "已恢复 " + id);
 }
 
 async function refreshCatalog(btn) {

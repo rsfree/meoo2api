@@ -102,6 +102,7 @@ type Config struct {
 	Failover          bool              `json:"failover"`            // 自动换号
 	KeepaliveSec      int               `json:"keepalive_sec"`       // SSE 心跳间隔，0 关闭
 	Aliases           map[string]string `json:"aliases,omitempty"`
+	AliasNotes        map[string]string `json:"alias_notes,omitempty"` // 别名备注，仅面板展示用
 	HiddenModels      []string          `json:"hidden_models,omitempty"`
 	AdminPass         string            `json:"admin_pass,omitempty"` // pbkdf2 编码
 }
