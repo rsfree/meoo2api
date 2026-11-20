@@ -247,6 +247,20 @@ internal/webui/     单页控制台（go:embed）
 docs/PROTOCOL.md    两条通道的抓包记录与上游接口清单
 ```
 
+## 发版
+
+push 到 `main` 自动递增 patch 并发版（`.github/workflows/release.yml`，零第三方 action）：
+
+- 版本号取最新 tag +1；仓库零 tag 时从 `v0.0.1` 起（冷启动回落 `v0.0.0`）
+- 交叉编译 `linux/amd64`、`linux/arm64`、`darwin/amd64`、`darwin/arm64`、`windows/amd64`
+- `dist/` 下产出二进制 + `SHA256SUMS`，全部挂到 GitHub Release
+- 移动 `latest` tag 指向新版本
+- 版本号通过 `-ldflags -X main.version=` 注入，`/healthz` 会自报（可用来核对镜像/二进制与 tag 是否一致）
+
+**逃生阀**：commit message 含 `[skip release]` 时整条流水线跳过，适合纯文档提交。
+注意它匹配的是整条 message，连"给逃生阀写说明"的提交自己也会命中——中招时用
+`gh workflow run release.yml --ref main` 补跑。
+
 ## 合规
 
 仅用于**你自己授权过的 Meoo 账号**在私有环境自用。批量注册、转售接口、绕过平台配额都违反上游服务条款，本项目不为这类用法提供任何支持。
