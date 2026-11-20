@@ -247,6 +247,32 @@ internal/webui/     单页控制台（go:embed）
 docs/PROTOCOL.md    两条通道的抓包记录与上游接口清单
 ```
 
+## Docker
+
+每个 release 会同步推一个镜像到 GHCR，三个 tag 指向同一 digest：
+
+```bash
+docker pull ghcr.io/rsfree/meoo2api:latest
+
+docker run -d --name meoo2api -p 8791:8791 \
+  -v "$PWD/data:/data" \
+  ghcr.io/rsfree/meoo2api:latest
+
+docker logs meoo2api 2>&1 | head -3    # 首次启动打印一次性管理密码
+```
+
+镜像以 UID 10001 运行，`/data` 是卷。**数据目录里有真实凭证，务必挂到自己的路径并保持 0600。**
+
+⚠️ 当前只发布 `linux/amd64`（CI runner 架构）。ARM 机器（含 Apple Silicon）两条路：
+
+```bash
+# 1) 源码构建：Dockerfile 走交叉编译，天然适配本机架构
+docker build -t meoo2api:local .
+
+# 2) 或在 x86 镜像上模拟运行（能跑，但慢）
+docker run --platform linux/amd64 ghcr.io/rsfree/meoo2api:latest
+```
+
 ## 发版
 
 push 到 `main` 自动递增 patch 并发版（`.github/workflows/release.yml`，零第三方 action）：
@@ -254,6 +280,7 @@ push 到 `main` 自动递增 patch 并发版（`.github/workflows/release.yml`�
 - 版本号取最新 tag +1；仓库零 tag 时从 `v0.0.1` 起（冷启动回落 `v0.0.0`）
 - 交叉编译 `linux/amd64`、`linux/arm64`、`darwin/amd64`、`darwin/arm64`、`windows/amd64`
 - `dist/` 下产出二进制 + `SHA256SUMS`，全部挂到 GitHub Release
+- 同时构建容器镜像推 GHCR，三 tag（`<version>` / `latest` / `sha-<short>`）同一 digest
 - 移动 `latest` tag 指向新版本
 - 版本号通过 `-ldflags -X main.version=` 注入，`/healthz` 会自报（可用来核对镜像/二进制与 tag 是否一致）
 
