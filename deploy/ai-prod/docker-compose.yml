@@ -1,0 +1,28 @@
+# 对齐 ai-prod-service-deploy 红线：
+# - 端口只绑回环 127.0.0.1:8791（公网入口一律 nginx + meoo2api.1task.cn）
+# - user 10001 对齐宿主属主，免 chown
+# - 镜像来自 GHCR（public），钉版本由 update.sh 的 IMAGE_TAG 控制
+services:
+  meoo2api:
+    image: ghcr.io/rsfree/meoo2api:${IMAGE_TAG:-latest}
+    container_name: meoo2api
+    restart: unless-stopped
+    user: "10001:10001"
+    ports:
+      - "127.0.0.1:8791:8791"
+    volumes:
+      - ./data:/data
+    environment:
+      TZ: Asia/Shanghai
+    healthcheck:
+      # busybox wget：镜像里没有 curl
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8791/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
