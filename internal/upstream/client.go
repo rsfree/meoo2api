@@ -58,9 +58,21 @@ type Client struct {
 
 // New 构造客户端；base 形如 https://api.meoo.host/meoo-ai/compatible-mode/v1
 func New(base string) *Client {
+	dial := &net.Dialer{Timeout: 15 * time.Second, KeepAlive: 30 * time.Second}
 	tr := &http.Transport{
-		Proxy:                 http.ProxyFromEnvironment,
-		DialContext:           (&net.Dialer{Timeout: 15 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		Proxy: http.ProxyFromEnvironment,
+		// 优先 IPv4：上游域名偶尔只解析出 AAAA，而部署机（如 ai-prod）没有 IPv6 路由，
+		// 直连会得到 "dial tcp [2408:...]:443: connect: network is unreachable"，
+		// 表现是「目录突然空了 / 所有请求 502」。先试 tcp4，失败再按原样回退，
+		// 这样有 IPv6 的机器行为不变，没 IPv6 的机器不会被一条 AAAA 记录打死。
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			if network == "tcp" {
+				if c, err := dial.DialContext(ctx, "tcp4", addr); err == nil {
+					return c, nil
+				}
+			}
+			return dial.DialContext(ctx, network, addr)
+		},
 		MaxIdleConns:          128,
 		MaxIdleConnsPerHost:   32,
 		IdleConnTimeout:       90 * time.Second,
