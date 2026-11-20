@@ -17,11 +17,14 @@ jobs:
   release:
     outputs:
       version: ${{ steps.ver.outputs.next }}
-    if: ${{ github.event_name == 'workflow_dispatch' || !contains(github.event.head_commit.message, '[skip release]') }}
+    if: ${{ github.event_name == 'workflow_dispatch' || !contains(github.event.head_commit.message || '', '[skip release]') }}
     runs-on: ubuntu-latest
     steps:
+      # 显式用 github.sha：分支 push 时 github.ref 是「会移动的」refs/heads/main，
+      # 而 release 阶段要等构建跑完，期间再有人 push 就会把 tag 打到别人的提交上。
       - uses: actions/checkout@v4
         with:
+          ref: ${{ github.sha }}
           fetch-depth: 0
 
       - uses: actions/setup-go@v5
@@ -33,9 +36,14 @@ jobs:
         id: ver
         run: |
           set -euo pipefail
-          PREV=$(git tag --list 'v*.*.*' --sort=-v:refname | head -n1 || true)
+          PREV=$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n1 || true)
           BASE=${PREV:-v0.0.0}
           IFS=. read -r MA MI PA <<< "${BASE#v}"
+          # 预发布/构建后缀（v1.2.3-rc.1）会让算术直接失败，先剥掉
+          PA="${PA%%[-+]*}"
+          case "$MA$MI$PA" in
+            *[!0-9]*) echo "::error::无法解析版本号 '$BASE'（要求 vX.Y.Z）"; exit 1 ;;
+          esac
           NEW="v${MA}.${MI}.$((PA + 1))"
           echo "prev=${PREV}" >> "$GITHUB_OUTPUT"
           echo "next=${NEW}" >> "$GITHUB_OUTPUT"
@@ -95,24 +103,42 @@ jobs:
           docker push "$IMAGE:latest"
           docker push "$IMAGE:sha-$SHORT"
           echo "pushed $IMAGE:$VER / latest / sha-$SHORT"
+          # 三个 tag 必须指向同一个 manifest digest（同一次构建内成立）。
+          # 用本地 RepoDigests 比对，比解析 docker push 的输出稳（那行格式会随版本变）。
+          DIGESTS=$(for t in "$VER" latest "sha-$SHORT"; do
+            docker inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$IMAGE:$t"
+          done | sed 's/.*@//' | sort -u | grep . || true)
+          N=$(printf '%s\n' "$DIGESTS" | grep -c . || true)
+          echo "digests: $DIGESTS"
+          [ "$N" -eq 1 ] || { echo "::error::三个 tag 的 digest 不一致：$DIGESTS"; exit 1; }
 
       - name: Create tag
         run: |
           set -euo pipefail
           git config user.name  'github-actions[bot]'
           git config user.email 'github-actions[bot]@users.noreply.github.com'
-          git tag -a '${{ steps.ver.outputs.next }}' -m 'Release ${{ steps.ver.outputs.next }}'
-          git push origin '${{ steps.ver.outputs.next }}'
+          TAG='${{ steps.ver.outputs.next }}'
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            echo "::error::tag $TAG 已存在（并发发版或有人手打），拒绝覆盖"; exit 1
+          fi
+          git tag -a "$TAG" -m "Release $TAG"
+          git push origin "$TAG"
 
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.ver.outputs.next }}
+          NOTES: ${{ steps.log.outputs.body }}
         run: |
           set -euo pipefail
-          gh release create '${{ steps.ver.outputs.next }}' \
-            --title 'Release ${{ steps.ver.outputs.next }}' \
-            --notes '${{ steps.log.outputs.body }}' \
-            dist/*
+          # 幂等：同一个 tag 重跑不应变红 —— 失败重试与补跑都依赖这个性质
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release $TAG already exists — skip creation"
+            exit 0
+          fi
+          # changelog 里出现单引号/反引号时，--notes '<多行>' 会把 shell 打炸；走文件
+          printf '%s\n' "$NOTES" > /tmp/notes.md
+          gh release create "$TAG" --title "Release $TAG" --notes-file /tmp/notes.md dist/*
 
       - name: Move latest tag
         run: |
