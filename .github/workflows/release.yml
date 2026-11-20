@@ -15,6 +15,8 @@ concurrency:
 
 jobs:
   release:
+    outputs:
+      version: ${{ steps.ver.outputs.next }}
     if: ${{ github.event_name == 'workflow_dispatch' || !contains(github.event.head_commit.message, '[skip release]') }}
     runs-on: ubuntu-latest
     steps:
@@ -123,3 +125,44 @@ jobs:
           name: dist-${{ steps.ver.outputs.next }}
           path: dist/
           retention-days: 30
+
+  # 部署到 ai-prod：只消费 release 产出的版本号，不重复判断版本逻辑
+  deploy:
+    needs: release
+    if: ${{ needs.release.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy to ai-prod
+        env:
+          SSH_KEY: ${{ secrets.AI_PROD_SSH_KEY }}
+          HOST: ${{ secrets.AI_PROD_HOST }}
+          VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          # 首次连接不交互确认；已知主机指纹由密钥本身保证（专用 key 只在 ci 机器与本机存在）
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 \
+            "root@${HOST}" "/opt/meoo2api/update.sh ${VERSION}"
+          rm -f ~/.ssh/deploy_key
+
+      - name: Verify public endpoint
+        env:
+          VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          # 走公网域名验证，确认 nginx → 容器这条链路也通，而不只是容器自己活着
+          for i in $(seq 1 10); do
+            BODY=$(curl -sf -m 10 https://meoo2api.1task.cn/healthz || true)
+            [ -n "$BODY" ] && break
+            sleep 3
+          done
+          echo "$BODY"
+          python3 - "$VERSION" "$BODY" <<'PY'
+          import json, sys
+          want, body = sys.argv[1].lstrip("v"), sys.argv[2]
+          d = json.loads(body)
+          assert d["version"].lstrip("v") == want, f"公网版本不符：期望 {want}，实际 {d['version']}"
+          print(f"  公网验收 OK · version={d['version']} · usable={d.get('usable')}")
+          PY
