@@ -248,7 +248,8 @@ func newHandler(gw *gateway.Handler, adm *admin.Handler) http.Handler {
 			path = "/"
 		}
 		// 面板本身不带 CORS；/v1 允许跨域，方便前端直连。
-		if !strings.HasPrefix(path, "/admin") && !strings.HasPrefix(path, "/api/") && path != "/" {
+		if !strings.HasPrefix(path, "/admin") && !strings.HasPrefix(path, "/api/") &&
+			path != "/" && path != "/index.html" && path != "/panel" {
 			w.Header().Set("Access-Control-Allow-Origin", "*")
 			w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Request-Id")
 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
@@ -259,7 +260,9 @@ func newHandler(gw *gateway.Handler, adm *admin.Handler) http.Handler {
 		}
 
 		switch {
-		case path == "/" || path == "/index.html":
+		// 面板 HTML 里所有接口都是 /admin/api/... 绝对路径，所以换任意别名路径直接吐同一份
+		// HTML 都不会失效；/panel 是用户最容易手输的地址，别再回 404。
+		case path == "/" || path == "/index.html" || path == "/panel":
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			w.Header().Set("Cache-Control", "no-store")
 			w.Header().Set("X-Frame-Options", "DENY")
