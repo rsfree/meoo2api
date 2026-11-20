@@ -1,0 +1,248 @@
+// Package upstream 封装对 Meoo OpenAI 兼容网关的 HTTP 调用与错误分类。
+package upstream
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"strings"
+	"time"
+)
+
+// 错误种类决定账号处置动作：只有 Retryable 的才换号。
+const (
+	KindOK         = "ok"
+	KindQuota      = "quota"       // 403 QUOTA_EXCEEDED：余额不足
+	KindAuth       = "auth"        // 401/403：凭证失效
+	KindRate       = "rate"        // 429：限流
+	KindServer     = "server"      // 5xx：上游故障
+	KindBadRequest = "bad_request" // 400 等：请求本身有问题，换号无意义
+	KindNetwork    = "network"     // 连接失败 / 超时
+	KindCanceled   = "canceled"    // 客户端取消
+)
+
+// Error 描述一次可分类的上游失败。
+type Error struct {
+	Status  int
+	Code    string
+	Message string
+	Kind    string
+}
+
+func (e *Error) Error() string {
+	if e.Code != "" {
+		return fmt.Sprintf("上游 %d %s: %s", e.Status, e.Code, e.Message)
+	}
+	return fmt.Sprintf("上游 %d: %s", e.Status, e.Message)
+}
+
+// Retryable 表示"换个账号同一请求可能成功"。
+func (e *Error) Retryable() bool {
+	switch e.Kind {
+	case KindQuota, KindAuth, KindRate, KindServer:
+		return true
+	}
+	return false
+}
+
+// Client 是共享连接池的上游 HTTP 客户端。
+type Client struct {
+	Base string
+	HTTP *http.Client
+}
+
+// New 构造客户端；base 形如 https://api.meoo.host/meoo-ai/compatible-mode/v1
+func New(base string) *Client {
+	tr := &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           (&net.Dialer{Timeout: 15 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		MaxIdleConns:          128,
+		MaxIdleConnsPerHost:   32,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   15 * time.Second,
+		ExpectContinueTimeout: 3 * time.Second,
+		ForceAttemptHTTP2:     true,
+	}
+	return &Client{Base: strings.TrimRight(base, "/"), HTTP: &http.Client{Transport: tr}}
+}
+
+// DoJSON 发送 JSON 请求并读回原始响应体；非 2xx 会解析为 *Error。
+func (c *Client) DoJSON(ctx context.Context, method, endpoint string, body any, hdr map[string]string) (int, []byte, error) {
+	var rdr io.Reader
+	if body != nil {
+		buf, err := json.Marshal(body)
+		if err != nil {
+			return 0, nil, err
+		}
+		rdr = bytes.NewReader(buf)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, endpoint, rdr)
+	if err != nil {
+		return 0, nil, err
+	}
+	req.Header.Set("Accept", "application/json")
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	for k, v := range hdr {
+		req.Header.Set(k, v)
+	}
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return 0, nil, classifyNet(err)
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if err != nil {
+		return resp.StatusCode, nil, classifyNet(err)
+	}
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		// Meoo 部分接口用 HTTP 200 + {"success":false,"errCode":…} 表达业务失败，
+		// 直接当成功会把错误数据当成正常响应透给客户端。
+		if be := parseBusinessEnvelope(raw); be != nil {
+			return resp.StatusCode, raw, be
+		}
+		return resp.StatusCode, raw, nil
+	}
+	return resp.StatusCode, raw, parseError(resp.StatusCode, raw)
+}
+
+// DoStream 发起流式请求，成功时返回未读取的响应体，由调用方消费并关闭。
+func (c *Client) DoStream(ctx context.Context, endpoint string, body any, hdr map[string]string) (*http.Response, error) {
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(buf))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "text/event-stream")
+	for k, v := range hdr {
+		req.Header.Set(k, v)
+	}
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, classifyNet(err)
+	}
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		return resp, nil
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	return nil, parseError(resp.StatusCode, raw)
+}
+
+// MergeHeader 返回带鉴权的最小头集合。
+func MergeHeader(ak string, extra map[string]string) map[string]string {
+	h := map[string]string{"Authorization": "Bearer " + ak}
+	for k, v := range extra {
+		h[k] = v
+	}
+	return h
+}
+
+func classifyNet(err error) error {
+	if errors.Is(err, context.Canceled) {
+		return &Error{Kind: KindCanceled, Message: "客户端取消"}
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return &Error{Kind: KindNetwork, Message: "上游超时"}
+	}
+	return &Error{Kind: KindNetwork, Message: err.Error()}
+}
+
+// parseBusinessEnvelope 识别 HTTP 200 的业务失败信封。
+func parseBusinessEnvelope(raw []byte) error {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		return nil
+	}
+	var a struct {
+		Success *bool  `json:"success"`
+		ErrCode string `json:"errCode"`
+		Message string `json:"message"`
+	}
+	if json.Unmarshal(trimmed, &a) != nil || a.Success == nil || *a.Success {
+		return nil
+	}
+	return &Error{Status: http.StatusOK, Code: a.ErrCode, Message: a.Message, Kind: classifyBusiness(a.ErrCode, a.Message)}
+}
+
+// classifyBusiness 按业务错误码/文案推断处置动作。
+func classifyBusiness(code, msg string) string {
+	u := strings.ToUpper(code + " " + msg)
+	switch {
+	case strings.Contains(u, "QUOTA"), strings.Contains(msg, "余额"), strings.Contains(msg, "额度"), strings.Contains(msg, "积分不足"):
+		return KindQuota
+	case strings.Contains(u, "AUTH"), strings.Contains(u, "TOKEN"), strings.Contains(u, "LOGIN"), strings.Contains(u, "UNAUTHORIZED"):
+		return KindAuth
+	case strings.Contains(u, "RATE"), strings.Contains(u, "LIMIT"), strings.Contains(u, "FREQUENT"), strings.Contains(msg, "频繁"):
+		return KindRate
+	}
+	return KindBadRequest
+}
+
+// parseError 把上游错误体归一化为 *Error。
+// 兼容两种信封：{"error":{...}} 与 {"success":false,"errCode":"…","message":"…"}
+func parseError(status int, raw []byte) error {
+	if status >= 200 && status < 300 {
+		if be := parseBusinessEnvelope(raw); be != nil {
+			return be
+		}
+	}
+	code, msg := "", strings.TrimSpace(string(raw))
+	if len(raw) > 0 {
+		var a struct {
+			Error struct {
+				Message string `json:"message"`
+				Code    any    `json:"code"`
+				Type    string `json:"type"`
+			} `json:"error"`
+			Success *bool  `json:"success"`
+			ErrCode string `json:"errCode"`
+			Message string `json:"message"`
+		}
+		if json.Unmarshal(raw, &a) == nil {
+			switch {
+			case a.Error.Message != "":
+				msg = a.Error.Message
+				switch c := a.Error.Code.(type) {
+				case string:
+					code = c
+				case float64:
+					code = fmt.Sprintf("%v", c)
+				}
+				if code == "" {
+					code = a.Error.Type
+				}
+			case a.ErrCode != "" || a.Message != "":
+				code, msg = a.ErrCode, a.Message
+			}
+		}
+	}
+	kind := KindBadRequest
+	switch {
+	case status == http.StatusPaymentRequired:
+		// 402 在所有 HTTP 语义里只有"需要付款/额度不足"这一含义。
+		// 上游常把它包成 invalid_request_error，必须先于内层码判定。
+		kind = KindQuota
+	case status == http.StatusUnauthorized || status == http.StatusForbidden:
+		kind = KindAuth
+		if strings.Contains(strings.ToUpper(code), "QUOTA") || strings.Contains(strings.ToUpper(msg), "余额") ||
+			strings.Contains(strings.ToUpper(msg), "QUOTA") || strings.Contains(msg, "额度") {
+			kind = KindQuota
+		}
+	case status == http.StatusTooManyRequests:
+		kind = KindRate
+	case status == http.StatusBadGateway || status == http.StatusServiceUnavailable || status == http.StatusGatewayTimeout || status >= 500:
+		kind = KindServer
+	}
+	return &Error{Status: status, Code: code, Message: msg, Kind: kind}
+}
