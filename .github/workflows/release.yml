@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: write
+  packages: write
 
 concurrency:
   group: release-${{ github.ref }}
@@ -74,6 +75,24 @@ jobs:
           [ -n "$(ls -A dist)" ] || { echo "::error::dist/ is empty"; exit 1; }
           ls -la dist
           (cd dist && sha256sum * > SHA256SUMS)
+
+      - name: Build & push image to GHCR
+        env:
+          VERSION: ${{ steps.ver.outputs.next }}
+        run: |
+          set -euo pipefail
+          # 镜像 tag 不带 v 前缀，且必须全小写
+          # 用 printf 转小写而不是 ${VAR,,}：后者是 bash 4+ 特性，本地干跑会报 bad substitution
+          IMAGE="ghcr.io/$(printf '%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')"
+          SHORT="$(git rev-parse --short=7 HEAD)"
+          VER="${VERSION#v}"
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker build --build-arg VERSION="$VERSION" \
+            -t "$IMAGE:$VER" -t "$IMAGE:latest" -t "$IMAGE:sha-$SHORT" .
+          docker push "$IMAGE:$VER"
+          docker push "$IMAGE:latest"
+          docker push "$IMAGE:sha-$SHORT"
+          echo "pushed $IMAGE:$VER / latest / sha-$SHORT"
 
       - name: Create tag
         run: |

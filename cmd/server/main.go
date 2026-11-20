@@ -17,6 +17,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	_ "time/tzdata" // 把时区库编进二进制：运行镜像无需 tzdata 包
 
 	"meoo2api/internal/account"
 	"meoo2api/internal/admin"

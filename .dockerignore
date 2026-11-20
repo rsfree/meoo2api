@@ -1,0 +1,8 @@
+# 绝不把运行期数据打进镜像：data/ 里有真实个人 AK 与 Cookie
+bin/
+data/
+*.log
+.DS_Store
+.git/
+.github/
+dist/
