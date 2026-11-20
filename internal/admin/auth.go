@@ -4,6 +4,7 @@ package admin
 import (
 	"crypto/rand"
 	"encoding/base64"
+	"fmt"
 	"net/http"
 	"strings"
 	"sync"
@@ -190,8 +191,44 @@ type failState struct {
 	until time.Time
 }
 
-// NewClientKey 签发一个 sk-… 客户端密钥。
+// NewClientKey 签发一个 sk-… 客户端密钥，值由 16 字节随机数生成。
 func NewClientKey(label string) *model.ClientKey {
-	k := "sk-" + model.RandID("", 16)
-	return &model.ClientKey{ID: model.RandID("c_", 6), Key: k, Label: label, Enabled: true, CreatedAt: model.NowMilli()}
+	return &model.ClientKey{
+		ID: model.RandID("c_", 6), Key: "sk-" + model.RandID("", 16),
+		Label: label, Enabled: true, CreatedAt: model.NowMilli(),
+	}
+}
+
+// NewClientKeyWith 签发客户端密钥；custom 非空时直接采用该值（如 sk-meoo2api）。
+//
+// 为什么允许自定义：多个 2api 部署并存时，人记不住 32 位随机串，而密钥一旦记错
+// 就变成"401 排查半天"。代价是猜得出来 —— 域名是公开的，sk-meoo2api 等于明文口令。
+// 所以这里只做格式与唯一性校验，不替使用者做安全决策；面板上另有醒目提示。
+func NewClientKeyWith(label, custom string) (*model.ClientKey, error) {
+	k := strings.TrimSpace(custom)
+	if k == "" {
+		k = "sk-" + model.RandID("", 16)
+	} else if err := ValidateClientKey(k); err != nil {
+		return nil, err
+	}
+	return &model.ClientKey{ID: model.RandID("c_", 6), Key: k, Label: label, Enabled: true, CreatedAt: model.NowMilli()}, nil
+}
+
+// ValidateClientKey 校验自定义密钥值：必须 sk- 开头、8–64 位、只含 [A-Za-z0-9._-]。
+// 字符集刻意收窄：密钥会进 shell / 配置 / URL，含空格或引号迟早出事故。
+func ValidateClientKey(k string) error {
+	if !strings.HasPrefix(k, "sk-") {
+		return fmt.Errorf("密钥必须以 sk- 开头")
+	}
+	if len(k) < 6 || len(k) > 64 {
+		return fmt.Errorf("密钥长度需在 6–64 个字符之间")
+	}
+	for _, r := range k {
+		ok := r == '-' || r == '_' || r == '.' ||
+			(r >= '0' && r <= '9') || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z')
+		if !ok {
+			return fmt.Errorf("密钥只能包含字母、数字与 - _ .")
+		}
+	}
+	return nil
 }

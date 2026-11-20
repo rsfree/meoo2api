@@ -975,11 +975,34 @@ async function keyAct(id, action, btn) {
   if (btn) { btn.disabled = false; btn.textContent = old; }
 }
 
-async function createClientKey() {
-  const label = prompt("给这个密钥起个名字（例如：我的电脑）", "api-key");
-  if (label === null) return;
+/* 签发密钥：标签默认按「sk-{部署二级域名}」生成（照 hostname 取第一段），
+   密钥值可留空走随机；填了就按填入的来——但面板必须先把代价说清楚。 */
+function createClientKey() {
+  const host = location.hostname || "";
+  // 本地调试时 hostname 是 127.0.0.1 / localhost，别生成 sk-127 这种鬼标签
+  const isIP = /^\d+(\.\d+){3}$/.test(host);
+  const sub = (isIP || host === "localhost" || !host) ? "api" : host.split(".")[0];
+  modal(`
+    <header><h2>签发客户端密钥</h2></header>
+    <div class="body">
+      <div class="field"><label>标签</label>
+        <input id="ckLabelIn" type="text" value="sk-${esc(sub)}" placeholder="sk-meoo2api"></div>
+      <div class="field"><label>密钥值<span class="hint">（留空 = 随机 32 位）</span></label>
+        <input id="ckKeyIn" type="text" class="mono" placeholder="sk-${esc(sub)} 或留空"></div>
+      <p class="hint">自定义值好记，但域名是公开的——<b>等于把口令写在门上</b>。只在能接受被猜到风险时用（内网、临时验证）。</p>
+    </div>
+    <footer><span class="grow"></span><button class="btn" onclick="closeModal()">取消</button>
+      <button class="btn primary" onclick="submitClientKey(this)">签发</button></footer>`);
+}
+
+async function submitClientKey(btn) {
+  btn.disabled = true;
   try {
-    const r = await api("/admin/api/clientkeys/create", { method: "POST", body: JSON.stringify({ label }) });
+    const body = {
+      label: ($("#ckLabelIn") || {}).value || "",
+      key: (($("#ckKeyIn") || {}).value || "").trim(),
+    };
+    const r = await api("/admin/api/clientkeys/create", { method: "POST", body: JSON.stringify(body) });
     if (r.ok) {
       await load();
       modal(`<header><h2>已签发</h2></header>
@@ -988,8 +1011,9 @@ async function createClientKey() {
           <div class="url" style="margin-bottom:0">${esc(r.key)}</div>
         </div>
         <footer><span class="grow"></span><button class="btn primary" onclick="closeModal()">我知道了</button></footer>`);
-    } else toast(r.error, true);
+    } else toast(r.error || "签发失败", true);
   } catch (e) { toast(e.message, true); }
+  btn.disabled = false;
 }
 
 async function ckAct(id, action) {

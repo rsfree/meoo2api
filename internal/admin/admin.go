@@ -589,6 +589,7 @@ func (h *Handler) keyAction(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) clientKeyCreate(w http.ResponseWriter, r *http.Request) {
 	var in struct {
 		Label string `json:"label"`
+		Key   string `json:"key"` // 可选：自定义密钥值（如 sk-meoo2api），留空则随机
 	}
 	if err := decodeJSON(r, &in); err != nil {
 		writeErr(w, 400, "bad_request", "请求格式错误")
@@ -597,8 +598,19 @@ func (h *Handler) clientKeyCreate(w http.ResponseWriter, r *http.Request) {
 	if strings.TrimSpace(in.Label) == "" {
 		in.Label = "api-key"
 	}
-	ck := NewClientKey(strings.TrimSpace(in.Label))
+	ck, err := NewClientKeyWith(strings.TrimSpace(in.Label), in.Key)
+	if err != nil {
+		writeErr(w, 400, "bad_key", err.Error())
+		return
+	}
 	h.St.Mu.Lock()
+	for _, c := range h.St.Data.ClientKeys {
+		if c.Key == ck.Key {
+			h.St.Mu.Unlock()
+			writeErr(w, 409, "duplicate_key", "该密钥值已存在")
+			return
+		}
+	}
 	h.St.Data.ClientKeys = append(h.St.Data.ClientKeys, ck)
 	h.St.Mu.Unlock()
 	if err := h.St.Save(); err != nil {
