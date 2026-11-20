@@ -125,7 +125,7 @@ func DefaultConfig() Config {
 		RateCooldownSec:   600,
 		Failover:          true,
 		KeepaliveSec:      12,
-		Aliases:           map[string]string{"qwen": "qwen3.8-flash", "ds": "deepseek-v4-flash-0731", "kimi": "kimi-k3"},
+		Aliases:           map[string]string{"qwen": "qwen3.8-flash", "ds": "deepseek-v4-flash-0731"},
 	}
 }
 

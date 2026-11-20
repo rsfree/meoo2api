@@ -93,7 +93,7 @@ curl http://127.0.0.1:8791/v1/chat/completions \
 
 ### 出站整形
 
-- `model` 走别名解析（默认 `qwen=qwen3.8-flash`、`ds=deepseek-v4-flash-0731`、`kimi=kimi-k3`）
+- `model` 走别名解析（默认 `qwen=qwen3.8-flash`、`ds=deepseek-v4-flash-0731`；kimi 系只在 Web agent 通道有，兼容通道不提供，别配）
 - `max_completion_tokens` 归一成 `max_tokens`
 - 客户端没给 `max_tokens` 时**不注入**（`default_max_tokens=0` 跟随上游），避免思考模型的预算被 800 掐死
 - 非流式请求丢弃 `stream_options`
@@ -373,7 +373,7 @@ Web 端标称 `context_window: 200000`，官方网关实测能吃到 280k 还没
 | `qwen3.7-max` | 7.2s | |
 | `qwen3.7-plus` | 8.2s | |
 
-另有别名 `qwen` → `qwen3.8-flash`、`ds` → `deepseek-v4-flash-0731`、`kimi` → `kimi-k3`。
+另有别名 `qwen` → `qwen3.8-flash`、`ds` → `deepseek-v4-flash-0731`。
 
 ### 并发与频控：96 并发零失败
 
