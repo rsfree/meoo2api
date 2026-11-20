@@ -261,6 +261,17 @@ push 到 `main` 自动递增 patch 并发版（`.github/workflows/release.yml`�
 注意它匹配的是整条 message，连"给逃生阀写说明"的提交自己也会命中——中招时用
 `gh workflow run release.yml --ref main` 补跑。
 
+### 发版链路实测
+
+| 步骤 | 结果 |
+|---|---|
+| 首次 push `main` | `v0.0.1`，5 个平台二进制 + `SHA256SUMS` 挂上 Release |
+| tag 解引用 | `v0.0.1^{}` == 触发提交（annotated tag 的 `object.sha` 是 tag 对象，别误判） |
+| `latest` | 指向同一 commit |
+| 二进制自报版本 | 下载 `darwin-arm64` 跑 `/healthz` → `"version":"v0.0.1"` |
+| 逃生阀 | 提交 message 带标记 → run `skipped`，无新版本 |
+| patch 自增 | 下一正常提交 → `v0.0.2` |
+
 ## 合规
 
 仅用于**你自己授权过的 Meoo 账号**在私有环境自用。批量注册、转售接口、绕过平台配额都违反上游服务条款，本项目不为这类用法提供任何支持。
