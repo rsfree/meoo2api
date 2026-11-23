@@ -185,8 +185,15 @@ func run() error {
 	}
 
 	// 先把模型目录同步一次再开监听：客户端第一眼拿到的就是真实目录。
-	syncCtx, syncCancel := context.WithTimeout(ctx, 15*time.Second)
-	cat.ProbeExtra(syncCtx) // 先验补充模型，Refresh 合并时才有 extraOK 可用
+	//
+	// 两件事必须各有独立预算。共用一个 15 秒预算时，ProbeExtra（串行验证 3 个
+	// 补充模型，实测吃掉 19 秒）会把预算耗尽，随后 Refresh 拿到的是一个已经
+	// deadline exceeded 的 ctx，直接返回 —— 目录空着启动，对外只剩两个本地别名，
+	// 而下次自动刷新要等 5 分钟。
+	probeCtx, probeCancel := context.WithTimeout(ctx, 20*time.Second)
+	cat.ProbeExtra(probeCtx) // 先验补充模型，Refresh 合并时才有 extraOK 可用
+	probeCancel()
+	syncCtx, syncCancel := context.WithTimeout(ctx, 25*time.Second)
 	cat.Refresh(syncCtx)
 	syncCancel()
 	catalogDone := cat.Start(ctx)

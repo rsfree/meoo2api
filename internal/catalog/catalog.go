@@ -167,50 +167,82 @@ func mergeExtra(base []Model, extra []string) []Model {
 // 回答还以为一切正常。宁可目录里少一个，也不能放进来一个假的。
 //
 // 成本：每个候选一次 1 token 请求，只在启动与手动刷新时跑。
+//
+// 并发执行的理由：3 个模型串行时每个要 5~10 秒，实测吃掉 19 秒，会把调用方给的
+// 启动预算整个耗光（主目录同步因此拿不到预算）。并发后总耗时 = 最慢的一个。
 func (s *Service) ProbeExtra(ctx context.Context) {
 	if len(s.Extra) == 0 || s.Picker == nil {
 		return
 	}
-	ok := make([]string, 0, len(s.Extra))
-	for _, id := range s.Extra {
-		id = strings.TrimSpace(id)
+	type result struct {
+		id     string
+		ok     bool
+		reason string
+	}
+	ch := make(chan result, len(s.Extra))
+	sem := make(chan struct{}, 3) // 同时最多 3 个，别把上游打花
+	var wg sync.WaitGroup
+	for _, raw := range s.Extra {
+		id := strings.TrimSpace(raw)
 		if id == "" {
 			continue
 		}
-		k := s.Picker.Pick(nil, model.DefaultProvider)
-		if k == nil {
-			break
-		}
-		body := map[string]any{
-			"model": id, "messages": []map[string]string{{"role": "user", "content": "ping"}},
-			"max_tokens": 1, "stream": false,
-		}
-		cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 20*time.Second)
-		code, raw, err := s.Up.DoJSON(cctx, "POST", s.Up.Base+"/chat/completions", body, upstream.MergeHeader(k.Key, nil))
-		cancel()
-		if err != nil || code != 200 {
-			log.Printf("补充模型 %s 验证失败：%s", id, describe(code, err))
+		wg.Add(1)
+		go func(id string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			ok, reason := s.probeOne(ctx, id)
+			ch <- result{id: id, ok: ok, reason: reason}
+		}(id)
+	}
+	go func() {
+		wg.Wait()
+		close(ch)
+	}()
+	ok := make([]string, 0, len(s.Extra))
+	for r := range ch {
+		if r.ok {
+			ok = append(ok, r.id)
 			continue
 		}
-		var resp struct {
-			Model string `json:"model"`
-		}
-		if json.Unmarshal(raw, &resp) != nil {
-			log.Printf("补充模型 %s 验证失败：响应不是 JSON", id)
-			continue
-		}
-		if resp.Model != id {
-			log.Printf("补充模型 %s 验证失败：上游静默回落到 %s，不纳入目录", id, resp.Model)
-			continue
-		}
-		ok = append(ok, id)
+		log.Printf("补充模型 %s 验证失败：%s", r.id, r.reason)
 	}
 	s.mu.Lock()
 	s.extraOK = ok
 	s.mu.Unlock()
 	if len(ok) > 0 {
+		sort.Strings(ok)
 		log.Printf("补充模型验证通过 %d/%d：%v", len(ok), len(s.Extra), ok)
 	}
+}
+
+// probeOne 验证单个补充模型；返回失败原因便于日志定位。
+func (s *Service) probeOne(ctx context.Context, id string) (bool, string) {
+	k := s.Picker.Pick(nil, model.DefaultProvider)
+	if k == nil {
+		return false, "没有可用凭证"
+	}
+	body := map[string]any{
+		"model": id, "messages": []map[string]string{{"role": "user", "content": "ping"}},
+		"max_tokens": 1, "stream": false,
+	}
+	cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 20*time.Second)
+	defer cancel()
+	code, raw, err := s.Up.DoJSON(cctx, "POST", s.Up.Base+"/chat/completions", body, upstream.MergeHeader(k.Key, nil))
+	if err != nil || code != 200 {
+		return false, describe(code, err)
+	}
+	var resp struct {
+		Model string `json:"model"`
+	}
+	if json.Unmarshal(raw, &resp) != nil {
+		return false, "响应不是 JSON"
+	}
+	if resp.Model != id {
+		return false, "上游静默回落到 " + resp.Model + "，不纳入目录"
+	}
+	return true, ""
 }
 
 // enrich 从 Meoo 站点目录补富元数据（context_window / max_tokens / multimodal / label / provider）。
@@ -444,6 +476,14 @@ type constErr string
 func (e constErr) Error() string { return string(e) }
 
 const errNoModels = constErr("上游模型目录为空")
+
+// ModelCount 返回真实上游模型条数（不含本地别名）。
+// 调用方判断「目录是否为空」必须用它：List 永远至少含别名。
+func (s *Service) ModelCount() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.models)
+}
 
 // List 返回对外可见的模型（应用别名与隐藏规则）。
 func (s *Service) List() ([]Model, bool, string) {

@@ -153,7 +153,11 @@ func (h *Handler) listModels(w http.ResponseWriter, r *http.Request) {
 	}
 	ms, stale, ferr := h.Catalog.List()
 	// 启动竞态或首次同步失败时，别让客户端看到"只有别名"的假目录。
-	if len(ms) == 0 {
+	//
+	// 判据必须是「真实上游模型数」而不是 len(ms)：List 永远至少返回本地别名，
+	// len(ms) 在目录全空时也是 2，这段兜底原先等于死代码 —— 目录同步一旦失败，
+	// 对外就只有 ds/qwen 两个别名，一直空到下一个 5 分钟刷新周期。
+	if h.Catalog.ModelCount() == 0 {
 		h.Catalog.Refresh(r.Context())
 		ms, stale, ferr = h.Catalog.List()
 	}
