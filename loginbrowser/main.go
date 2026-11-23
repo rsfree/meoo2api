@@ -313,17 +313,39 @@ func (m *manager) action(w http.ResponseWriter, r *http.Request) {
 	case "password":
 		err = s.b.setInput("fm-login-password", in.Value)
 	case "agree":
-		err = s.b.clickBySelector("#fm-agreement-checkbox")
+		// 必须幂等：页面默认就勾上了，再 click 一次反而是取消勾选。
+		err = s.b.ensureChecked("fm-agreement-checkbox")
 	case "getcode":
-		if err = s.b.clickBySelector(".send-btn-link"); err == nil {
-			time.Sleep(1500 * time.Millisecond)
-			if st, e := s.b.pageState(); e == nil {
+		// 同样先确保协议是勾上的：漏了这一步，点击会被页面静默拦下（只弹一句
+		// 「请阅读并同意协议」），请求根本不出网，调用方却会以为已经发出去了。
+		if err = s.b.ensureChecked("fm-agreement-checkbox"); err == nil {
+			err = s.b.clickBySelector(".send-btn-link")
+		}
+		if err == nil {
+			// 判定标准只有一个：按钮文案离开「获取验证码」（变成「xx秒后重发」）
+			// 才算阿里云受理。之前只 sleep 1.5s 看一眼、什么都没变也返回 ok，
+			// 于是「一条短信都没发」被当成「已发送」报给前端。
+			var last pageState
+			accepted := false
+			for i := 0; i < 12 && !accepted; i++ {
+				time.Sleep(500 * time.Millisecond)
+				st, e := s.b.pageState()
+				if e != nil {
+					continue
+				}
+				last = st
 				if st.CheckcodeVisible {
 					note = "图片验证码已弹出：风控介入，需要人工识别后填 #fm-login-checkcode"
+					accepted = true
+					break
 				}
 				if st.SendBtn != "" && st.SendBtn != "获取验证码" {
 					note = strings.TrimSpace(note + " 按钮状态：" + st.SendBtn)
+					accepted = true
 				}
+			}
+			if !accepted && last.SendBtn != "" {
+				err = fmt.Errorf("发码未生效：按钮仍是「%s」，页面提示「%s」", last.SendBtn, clipText(last.Text))
 			}
 		}
 	case "submit":

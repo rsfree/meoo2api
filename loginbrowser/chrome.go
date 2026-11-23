@@ -203,6 +203,33 @@ func (b *browser) clickBySelector(sel string) error {
 	return nil
 }
 
+// ensureChecked 把复选框置为「已勾选」，幂等。
+// 🔴 阿里云这版登录页的协议框默认就是勾上的，无脑 click 等于把它取消：
+// 表现是点「获取验证码」毫无反应、页面只提示「请阅读并同意协议」、一条短信都不发，
+// 而调用方拿到的是空 note —— 面板于是对外宣称「验证码已发送」，用户永远等不到码。
+func (b *browser) ensureChecked(id string) error {
+	expr := fmt.Sprintf(`(() => {
+	  const el = document.getElementById(%q);
+	  if (!el) return 'no-el';
+	  if (el.checked) return 'ok';
+	  el.scrollIntoView({block:'center'});
+	  el.click();
+	  return el.checked ? 'ok' : 'unchecked';
+	})()`, id)
+	got, err := b.eval(8*time.Second, expr)
+	if err != nil {
+		return fmt.Errorf("勾选 #%s 失败: %w", id, err)
+	}
+	switch got {
+	case "ok":
+		return nil
+	case "no-el":
+		return fmt.Errorf("#%s 不存在", id)
+	default:
+		return fmt.Errorf("#%s 点击后仍未勾上（%s）", id, got)
+	}
+}
+
 // clickButtonByText 提交按钮没有稳定 id，按可见文字点。
 func (b *browser) clickButtonByText(text string) error {
 	// 页面上是 "登录 / 注册"，实际 innerText 可能带各种空白；两边都归一化再比。
@@ -255,6 +282,16 @@ func (b *browser) pageState() (pageState, error) {
 		return pageState{}, err
 	}
 	return st, nil
+}
+
+// clipText 截断页面文本：错误信息里带一点上下文就够，别把整页正文塞进响应。
+func clipText(s string) string {
+	s = strings.TrimSpace(s)
+	r := []rune(s)
+	if len(r) > 120 {
+		return string(r[:120]) + "…"
+	}
+	return s
 }
 
 func (b *browser) screenshot() ([]byte, error) {
