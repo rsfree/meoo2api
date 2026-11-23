@@ -344,8 +344,15 @@ func (m *manager) action(w http.ResponseWriter, r *http.Request) {
 					accepted = true
 				}
 			}
-			if !accepted && last.SendBtn != "" {
-				err = fmt.Errorf("发码未生效：按钮仍是「%s」，页面提示「%s」", last.SendBtn, clipText(last.Text))
+			// 只要没拿到"已受理"的证据就必须报错。曾经这里多一个 last.SendBtn != ""
+			// 的前置条件：12 次 pageState 全部失败时 last 保持零值，条件不成立，
+			// err 仍是 nil —— 浏览器已经挂了却照样对外宣称"验证码已发送"。
+			if !accepted {
+				if last.SendBtn != "" {
+					err = fmt.Errorf("发码未生效：按钮仍是「%s」，页面提示「%s」", last.SendBtn, clipText(last.Text))
+				} else {
+					err = fmt.Errorf("发码未确认：6 秒内始终读不到页面状态，浏览器可能已断开，请重试")
+				}
 			}
 		}
 	case "submit":
