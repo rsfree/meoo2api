@@ -49,6 +49,9 @@ func TestNormalizeRejectsImageForTextModel(t *testing.T) {
 	if ce.param != "messages" {
 		t.Fatalf("param 应为 messages，得到 %q", ce.param)
 	}
+	if ce.desc == "" {
+		t.Fatal("运行日志需要可读描述，不能只写一个 code")
+	}
 }
 
 func TestNormalizeKeepsImageForVisionModel(t *testing.T) {

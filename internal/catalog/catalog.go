@@ -477,6 +477,21 @@ func (e constErr) Error() string { return string(e) }
 
 const errNoModels = constErr("上游模型目录为空")
 
+// Lookup 按 ID 查全量目录（含被面板隐藏的模型）。
+//
+// 能力判断必须用它而不是 List：List 会过滤 hidden_models，但隐藏只影响目录展示，
+// 不影响可调用性 —— 用 List 会导致「模型一被隐藏，网关就判不出它是否支持图片」。
+func (s *Service) Lookup(id string) (Model, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, m := range s.models {
+		if m.ID == id {
+			return m, true
+		}
+	}
+	return Model{}, false
+}
+
 // ModelCount 返回真实上游模型条数（不含本地别名）。
 // 调用方判断「目录是否为空」必须用它：List 永远至少含别名。
 func (s *Service) ModelCount() int {
