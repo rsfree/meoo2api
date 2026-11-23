@@ -214,7 +214,13 @@ func (h *Handler) chat(w http.ResponseWriter, r *http.Request) {
 	reqModel, _ := body["model"].(string)
 	resolved := h.Catalog.Resolve(reqModel)
 	// 模型决定供应商：目录里的 provider 字段是「模型 → 上游」的唯一权威。
+	// 但站点目录的 provider 是上游后端厂商标签（如 bailian=阿里百炼），未必
+	// 是我方注册过的上游名。只有登记在注册表里的名字才能当路由键，否则按
+	// 元数据处理、回退默认上游——否则号池里找不到同名凭证，直接 503。
 	prov := h.Catalog.ProviderOf(resolved)
+	if h.Reg != nil && !h.Reg.Has(prov) {
+		prov = model.DefaultProvider
+	}
 	stream, _ := body["stream"].(bool)
 
 	h.St.Mu.RLock()

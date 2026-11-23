@@ -1005,6 +1005,9 @@ func (h *Handler) test(w http.ResponseWriter, r *http.Request) {
 	}
 	mdl := h.Catalog.Resolve(in.Model)
 	prov := h.Catalog.ProviderOf(mdl)
+	if h.Reg != nil && !h.Reg.Has(prov) { // 见 gateway：目录 provider 未必可路由
+		prov = model.DefaultProvider
+	}
 	key := h.Picker.Pick(map[string]bool{}, prov)
 	if key == nil {
 		writeErr(w, 503, "no_available_key", "号池中没有可用凭证（provider=" + prov + "）")
