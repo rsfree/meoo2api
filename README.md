@@ -178,6 +178,9 @@ HTTP 状态兜底 → 502 upstream_error
 | `MEOO_AI_BASE` | `https://api.meoo.host/meoo-ai/compatible-mode/v1` | 上游网关 |
 | `MEOO_PROJECT_AK` | — | 首启预置一个项目 AK |
 | `MEOO2API_KEYS` | — | 首启预置客户端密钥，逗号分隔 |
+| `MEOO_WEB_BASE` | `https://meoo.com` | 富元数据目录所在站点（只补字段，不扩模型集合） |
+| `MEOO_METADATA` | `on` | 设 `off` 关闭元数据补全，目录退回纯 ID 列表 |
+| `MEOO_CATALOG_REFRESH_SEC` | `300` | 目录自动刷新周期（秒），最短 30；改完重启一次即生效 |
 
 > 面板也能直接签发密钥：标签建议按 `sk-{部署二级域名}`（如 `sk-meoo2api`），值留空则随机 32 位。
 > 填自定义值（如直接写 `sk-meoo2api`）好记，但域名是公开的 —— 等于把口令写在门上，只在能接受被猜到的场景用。
@@ -377,6 +380,19 @@ Web 端标称 `context_window: 200000`，官方网关实测能吃到 280k 还没
 | `qwen3.7-plus` | 8.2s | |
 
 另有别名 `qwen` → `qwen3.8-flash`、`ds` → `deepseek-v4-flash-0731`。
+
+**为什么不是更多？** 兼容网关对模型有**硬白名单**，多传一个就 `400 MODEL_NOT_SUPPORTED`，
+报错原文会把允许的 10 个模型直接列出来。Meoo 站点目录（`/api/v1/agent/models`）里另有
+`auto`、`moonshot/kimi-k3`、`moonshot/kimi-k3.1-pro`、`MiniMax/MiniMax-M3.1-Flash`、
+`bigmodel/glm-5.3`、`bigmodel/glm-5.3-flash` 六个，它们只走 Web agent 通道（Cookie + SSE），
+本网关按设计不接 —— 列进 `/v1/models` 只会让客户端以为能用、一请求就 404。
+
+所以目录分两层：**可调用集合**取自兼容网关（决定上不上架），
+**元数据**（`context_window` / `max_tokens` / `multimodal` / `label` / `provider` / `description`）
+取自站点目录（项目 AK 即可读，不需要 Cookie），每次刷新时按 ID 对齐覆盖。
+站点目录独有的 6 个只在面板显示为「另有 N 个」，不进 `/v1/models`。
+
+目录每 5 分钟自动刷新一次（可配），别名与隐藏规则的改动**立即生效**，都不用重启。
 
 ### 并发与频控：96 并发零失败
 

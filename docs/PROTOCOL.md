@@ -224,6 +224,40 @@ data: {"type":"task_complete","text":"1 + 1 = 2。\n\n有其他问题随时问�
 
 每条带 `context_window`（多为 200000）、`max_token`（64000 / 16384）、`multimodal`、`reasoningControl`。
 
+### 2026-11-23 复测：16 个，且**只有项目 AK 能读**
+
+`GET https://meoo.com/api/v1/agent/models` 用项目 AK（`meoo_project_…`）直接 200，
+带不带 `X-Meoo-Client: cli` 都一样，**不需要 Cookie**。完整 16 个：
+
+```
+auto
+qwen3.8-flash  qwen4-max  qwen3.8-max  qwen3.7-max  qwen3.7-plus
+deepseek-v4.1-flash-1017  deepseek-v4-pro-0813  deepseek-v4-flash-0731
+glm-5.2  glm-5.2-fast-preview
+moonshot/kimi-k3  moonshot/kimi-k3.1-pro
+MiniMax/MiniMax-M3.1-Flash
+bigmodel/glm-5.3  bigmodel/glm-5.3-flash
+```
+
+后 6 个（ideaLab 系 + auto）**在兼容网关调不通**，实测：
+
+```bash
+curl -s https://api.meoo.host/meoo-ai/compatible-mode/v1/chat/completions \
+  -H "Authorization: Bearer $PROJECT_AK" -H 'Content-Type: application/json' \
+  -d '{"model":"bigmodel/glm-5.3","messages":[{"role":"user","content":"hi"}],"max_tokens":8}'
+# 400 MODEL_NOT_SUPPORTED
+# 当前仅支持配置模型: qwen3.8-flash、qwen4-max、…、glm-5.2
+```
+
+`/open/v1/*` 下也没有第二条对话入口（`chat/completions`、`models`、
+`cli-compat/models`、`cli-compat/chat/completions`、`cli-compat/projects/{id}/models`
+全部 404）。
+
+**结论：`/v1/models` 的天花板就是 10 个，不是抓漏。**
+站点目录的价值在于元数据：它的 10 个重叠条目 10/10 带
+`context_window=200000`、`max_token=64000`、`label`、`provider`、`description`，
+网关据此做「只补字段、不扩集合」的 overlay（`catalog.enrich`）。
+
 ---
 
 ## 五、两条通道怎么选

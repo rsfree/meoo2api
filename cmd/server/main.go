@@ -139,6 +139,16 @@ func run() error {
 	acc := &account.Service{St: st, Up: up}
 	pk := &pool.Picker{St: st, Up: up}
 	cat := catalog.New(st, pk, up)
+	// 富元数据目录：用项目 AK 读 Meoo 站点 /api/v1/agent/models，只给已上架模型补
+	// context_window / max_tokens / multimodal / label；不扩集合（硬白名单之外的调不通）。
+	// MEOO_METADATA=off 可整体关闭，MEOO_WEB_BASE 可指向镜像站点。
+	if !strings.EqualFold(env("MEOO_METADATA", "on"), "off") {
+		cat.WebBase = strings.TrimRight(env("MEOO_WEB_BASE", "https://meoo.com"), "/")
+	}
+	// 目录自动刷新周期（热更新）：默认 300 秒，改这个值不用重新编译。
+	if sec, cerr := strconv.Atoi(env("MEOO_CATALOG_REFRESH_SEC", "")); cerr == nil && sec > 0 {
+		cat.RefreshEvery = time.Duration(sec) * time.Second
+	}
 	gw := &gateway.Handler{St: st, Picker: pk, Catalog: cat, Up: up, Log: lg}
 	adm := admin.New(st, pk, acc, cat, up, lg)
 

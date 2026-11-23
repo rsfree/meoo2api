@@ -205,7 +205,12 @@ func (h *Handler) state(w http.ResponseWriter, r *http.Request) {
 	ms, stale, ferr := h.Catalog.List()
 	models := make([]map[string]any, 0, len(ms))
 	for _, m := range ms {
-		models = append(models, map[string]any{"id": m.ID, "context_window": m.ContextWindow, "max_tokens": m.MaxTokens, "description": m.Description})
+		models = append(models, map[string]any{
+			"id": m.ID, "label": m.Label, "provider": m.Provider,
+			"context_window": m.ContextWindow, "max_tokens": m.MaxTokens,
+			"multimodal": m.Multimodal, "description": m.Description,
+			"alias": m.OwnedBy == "meoo-alias",
+		})
 	}
 	writeJSON(w, 200, map[string]any{
 		"ok":          true,

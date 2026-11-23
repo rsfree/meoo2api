@@ -96,6 +96,33 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// modelCard 把目录条目转成 OpenAI 模型卡。列表与单查共用同一份，
+// 避免出现「列表有元数据、单查没有」这种字段漂移。
+func modelCard(m catalog.Model) map[string]any {
+	item := map[string]any{
+		"id": m.ID, "object": "model", "created": m.Created, "owned_by": m.OwnedBy,
+	}
+	if m.ContextWindow > 0 {
+		item["context_window"] = m.ContextWindow
+	}
+	if m.MaxTokens > 0 {
+		item["max_tokens"] = m.MaxTokens
+	}
+	if m.Multimodal {
+		item["multimodal"] = true
+	}
+	if m.Label != "" {
+		item["label"] = m.Label
+	}
+	if m.Provider != "" {
+		item["provider"] = m.Provider
+	}
+	if m.Description != "" {
+		item["description"] = m.Description
+	}
+	return item
+}
+
 func (h *Handler) listModels(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		writeSpecStatus(w, specs["invalid_request"], http.StatusMethodNotAllowed, "")
@@ -113,20 +140,7 @@ func (h *Handler) listModels(w http.ResponseWriter, r *http.Request) {
 	}
 	data := make([]any, 0, len(ms))
 	for _, m := range ms {
-		item := map[string]any{"id": m.ID, "object": "model", "created": m.Created, "owned_by": m.OwnedBy}
-		if m.ContextWindow > 0 {
-			item["context_window"] = m.ContextWindow
-		}
-		if m.MaxTokens > 0 {
-			item["max_tokens"] = m.MaxTokens
-		}
-		if m.Multimodal {
-			item["multimodal"] = true
-		}
-		if m.Description != "" {
-			item["description"] = m.Description
-		}
-		data = append(data, item)
+		data = append(data, modelCard(m))
 	}
 	w.Header().Set("X-Meoo-Models-Source", map[bool]string{true: "stale", false: "live"}[stale])
 	if ferr != "" {
@@ -143,7 +157,7 @@ func (h *Handler) getModel(w http.ResponseWriter, r *http.Request, id string) {
 	ms, _, _ := h.Catalog.List()
 	for _, m := range ms {
 		if m.ID == id {
-			writeJSON(w, http.StatusOK, map[string]any{"id": m.ID, "object": "model", "created": m.Created, "owned_by": m.OwnedBy})
+			writeJSON(w, http.StatusOK, modelCard(m))
 			return
 		}
 	}

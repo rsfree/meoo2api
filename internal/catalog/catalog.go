@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"meoo2api/internal/model"
 	"meoo2api/internal/pool"
 	"meoo2api/internal/store"
 	"meoo2api/internal/upstream"
@@ -24,6 +25,8 @@ type Model struct {
 	ContextWindow int    `json:"context_window,omitempty"`
 	MaxTokens     int    `json:"max_tokens,omitempty"`
 	Multimodal    bool   `json:"multimodal,omitempty"`
+	Label         string `json:"label,omitempty"`
+	Provider      string `json:"provider,omitempty"`
 	Description   string `json:"description,omitempty"`
 }
 
@@ -33,12 +36,23 @@ type Service struct {
 	Picker *pool.Picker
 	Up     *upstream.Client
 
+	// WebBase 是 Meoo 站点根（如 https://meoo.com）。非空时用它拉富元数据目录
+	// （/api/v1/agent/models，项目 AK 可读）给兼容网关已上架的模型补字段。
+	// 只补字段、不扩集合：站点目录里的 kimi/glm-5.3 等走的是另一条通道，兼容网关调不通。
+	WebBase string
+	// RefreshEvery 是目录自动刷新周期；0 表示默认 5 分钟。
+	RefreshEvery time.Duration
+
 	mu       sync.RWMutex
 	models   []Model
 	defaultM string
 	fetched  time.Time
 	stale    bool
 	lastErr  string
+	webOnly  []string // 站点目录有、兼容网关没有的模型（仅面板提示，不可调用）
+	metaOK   int      // 本轮成功补到元数据的条数
+	metaAt   time.Time
+	metaErr  string
 }
 
 // New 构造目录服务。
@@ -52,7 +66,7 @@ func (s *Service) Start(ctx context.Context) <-chan struct{} {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		t := time.NewTicker(5 * time.Minute)
+		t := time.NewTicker(s.interval())
 		defer t.Stop()
 		for {
 			select {
@@ -64,6 +78,15 @@ func (s *Service) Start(ctx context.Context) <-chan struct{} {
 		}
 	}()
 	return done
+}
+
+// interval 返回自动刷新周期：默认 5 分钟，可用 RefreshEvery 覆盖（最短 30 秒，
+// 防止误配成 1 秒把上游打成 DDoS）。
+func (s *Service) interval() time.Duration {
+	if s.RefreshEvery >= 30*time.Second {
+		return s.RefreshEvery
+	}
+	return 5 * time.Minute
 }
 
 // Refresh 拉取上游目录。成功则整体替换，失败保留旧目录并标记过期。
@@ -97,6 +120,8 @@ func (s *Service) Refresh(ctx context.Context) {
 		s.mu.Lock()
 		s.models, s.defaultM, s.fetched, s.stale, s.lastErr = ms, def, time.Now(), false, ""
 		s.mu.Unlock()
+		// 元数据补全与主目录解耦：失败只记 metaErr，不影响可调用集合。
+		s.enrich(ctx, k)
 		return
 	}
 	s.mu.Lock()
@@ -104,6 +129,80 @@ func (s *Service) Refresh(ctx context.Context) {
 		s.stale = true
 	}
 	s.mu.Unlock()
+}
+
+// enrich 从 Meoo 站点目录补富元数据（context_window / max_tokens / multimodal / label / provider）。
+//
+// 为什么不把它直接当模型源：兼容网关对模型有硬白名单（实测 MODEL_NOT_SUPPORTED，
+// 报错里直接列出 10 个可配置模型），站点目录里 kimi-k3、glm-5.3、minimax、auto 这些
+// 在兼容网关调不通。列进 /v1/models 只会让客户端以为能用、一请求就 400。
+// 所以这里的契约是「只补字段、不扩集合」，多出来的记进 webOnly 供面板提示。
+func (s *Service) enrich(ctx context.Context, k *model.Key) {
+	if s.WebBase == "" || k == nil {
+		return
+	}
+	// 用 WithoutCancel：启动同步总共只有 15 秒预算，主目录拉完可能已所剩无几，
+	// 元数据不该因此被砍掉而白等 5 分钟。停机时最多多拖 12 秒。
+	cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 12*time.Second)
+	defer cancel()
+	url := strings.TrimRight(s.WebBase, "/") + "/api/v1/agent/models"
+	code, raw, err := s.Up.DoJSON(cctx, "GET", url, nil, upstream.MergeHeader(k.Key, nil))
+	if err != nil || code != 200 {
+		s.mu.Lock()
+		s.metaErr = "站点目录 " + describe(code, err)
+		s.mu.Unlock()
+		return
+	}
+	web, _, perr := parse(raw)
+	if perr != nil {
+		s.mu.Lock()
+		s.metaErr = "站点目录解析失败: " + perr.Error()
+		s.mu.Unlock()
+		return
+	}
+	byID := make(map[string]Model, len(web))
+	for _, m := range web {
+		byID[m.ID] = m
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	known := make(map[string]bool, len(s.models))
+	filled := 0
+	for i := range s.models {
+		cur := &s.models[i]
+		known[cur.ID] = true
+		w, ok := byID[cur.ID]
+		if !ok {
+			continue
+		}
+		filled++
+		// 逐字段「有值才覆盖」：站点目录给 false/空值时保留原值，避免元数据回退。
+		if w.ContextWindow > 0 {
+			cur.ContextWindow = w.ContextWindow
+		}
+		if w.MaxTokens > 0 {
+			cur.MaxTokens = w.MaxTokens
+		}
+		if w.Label != "" {
+			cur.Label = w.Label
+		}
+		if w.Provider != "" {
+			cur.Provider = w.Provider
+		}
+		if w.Description != "" {
+			cur.Description = w.Description
+		}
+		cur.Multimodal = cur.Multimodal || w.Multimodal
+	}
+	only := make([]string, 0, len(web))
+	for _, m := range web {
+		if !known[m.ID] {
+			only = append(only, m.ID)
+		}
+	}
+	sort.Strings(only)
+	s.webOnly, s.metaOK, s.metaErr, s.metaAt = only, filled, "", time.Now()
 }
 
 func describe(code int, err error) string {
@@ -166,7 +265,8 @@ func (m mJSON) toModel() (Model, bool) {
 		maxTok = m.MaxToken
 	}
 	return Model{ID: id, Object: obj, Created: m.Created, OwnedBy: owner,
-		ContextWindow: m.ContextWindow, MaxTokens: maxTok, Multimodal: m.Multimodal, Description: m.Description}, true
+		ContextWindow: m.ContextWindow, MaxTokens: maxTok, Multimodal: m.Multimodal,
+		Label: m.Label, Provider: m.Provider, Description: m.Description}, true
 }
 
 // parseModelList 把一段 JSON 解成模型条目列表。
@@ -306,6 +406,7 @@ func (s *Service) List() ([]Model, bool, string) {
 		for _, b := range base {
 			if b.ID == aliases[name] {
 				m.ContextWindow, m.MaxTokens, m.Multimodal = b.ContextWindow, b.MaxTokens, b.Multimodal
+				m.Label, m.Provider = b.Label, b.Provider
 				break
 			}
 		}
@@ -350,11 +451,21 @@ func (s *Service) Status() map[string]any {
 	if !s.fetched.IsZero() {
 		fetched = s.fetched.UnixMilli()
 	}
+	var metaAt int64
+	if !s.metaAt.IsZero() {
+		metaAt = s.metaAt.UnixMilli()
+	}
+	// webOnly 是站点目录独有、兼容网关调不通的模型；面板据此提示，绝不并入 List。
+	webOnly := append([]string(nil), s.webOnly...)
 	return map[string]any{
 		"count":         len(s.models),
 		"default_model": s.defaultM,
 		"fetched_at":    fetched,
 		"source":        src,
 		"error":         s.lastErr,
+		"web_only":      webOnly,
+		"meta_ok":       s.metaOK,
+		"meta_at":       metaAt,
+		"meta_error":    s.metaErr,
 	}
 }

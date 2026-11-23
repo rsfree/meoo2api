@@ -1033,7 +1033,7 @@ function viewModels() {
   const aliasRows = Object.entries(st.aliases);
   // 隐藏的模型不在 state.models 里（catalog.List 已过滤），单独补出来才能取消隐藏
   const hiddenRows = [...st.hidden].filter((id) => !st.aliases[id]).map((id) => ({ id, hidden: true }));
-  const visibleRows = st.models.filter((m) => !st.aliases[m.id]).map((m) => ({ id: m.id, hidden: false }));
+  const visibleRows = st.models.filter((m) => !st.aliases[m.id]).map((m) => ({ ...m, hidden: false }));
   const modelRows = visibleRows.concat(hiddenRows);
 
   return `
@@ -1078,24 +1078,29 @@ function viewModels() {
   </div>
 
   <div class="box">
-    <header><h3>内置模型<span class="hint">勾「隐藏」后 /v1/models 与别名下拉里都不再出现</span></h3>
+    <header><h3>内置模型<span class="hint">上游兼容网关的可调用集合；勾「隐藏」后 /v1/models 与别名下拉里都不再出现</span></h3>
       <span class="grow"></span>
-      <span class="note">${(cat.count || 0) === 0 ? "尚未同步" : (cat.source === "stale" ? "过期缓存" : "实时同步") + " · " + cat.count + " 个 · " + ago(cat.fetched_at)}</span>
+      <span class="note">${(cat.count || 0) === 0 ? "尚未同步" : (cat.source === "stale" ? "过期缓存" : "实时同步") + " · " + cat.count + " 个 · " + ago(cat.fetched_at)}${cat.meta_ok ? " · 元数据 " + cat.meta_ok + " 条" : ""}</span>
       <button class="xs" onclick="refreshCatalog(this)">同步</button>
     </header>
     <div class="tbl-wrap">
       <table class="acc" style="min-width:560px">
-        <thead><tr><th>模型 ID</th><th class="opt">本机用量</th><th style="width:88px">隐藏</th></tr></thead>
+        <thead><tr><th>模型</th><th>上下文</th><th>最大输出</th><th>能力</th><th class="opt">本机用量</th><th style="width:88px">隐藏</th></tr></thead>
         <tbody>${modelRows.length ? modelRows.map((m) => `
           <tr>
-            <td class="mono nw">${esc(m.id)}${m.hidden ? ' <span class="tag mute">已隐藏</span>' : ""}</td>
+            <td class="nw"><div class="mono">${esc(m.id)}</div>${m.label ? `<div class="hint">${esc(m.label)}</div>` : ""}</td>
+            <td class="num">${m.context_window ? nf(m.context_window) : "—"}</td>
+            <td class="num">${m.max_tokens ? nf(m.max_tokens) : "—"}</td>
+            <td>${m.multimodal ? '<span class="tag ok">多模态</span>' : '<span class="hint">纯文本</span>'}${m.hidden ? ' <span class="tag mute">已隐藏</span>' : ""}</td>
             <td class="num opt">${st.usage[m.id] ? nf(st.usage[m.id]) : "—"}</td>
             <td><input type="checkbox" ${m.hidden ? "checked" : ""} onchange="toggleHidden('${esc(m.id)}',this.checked)" style="width:auto"></td>
-          </tr>`).join("") : emptyRow(3, "目录为空", "至少需要一个可用凭证才能同步上游模型")}
+          </tr>`).join("") : emptyRow(6, "目录为空", "至少需要一个可用凭证才能同步上游模型")}
         </tbody>
       </table>
     </div>
     ${cat.error ? `<div class="foot"><span class="hint" style="color:var(--bad)">${esc(cat.error)}</span></div>` : ""}
+    ${(cat.web_only && cat.web_only.length) ? `<div class="foot"><span class="hint">站点目录另有 <b>${cat.web_only.length}</b> 个模型（<span class="mono">${cat.web_only.map(esc).join("、")}</span>）走 Web agent 通道，兼容网关会拒绝，故未列入。</span></div>` : ""}
+    ${cat.meta_error ? `<div class="foot"><span class="hint" style="color:var(--bad)">元数据源：${esc(cat.meta_error)}</span></div>` : ""}
   </div>`;
 }
 
