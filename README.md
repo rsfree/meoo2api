@@ -123,7 +123,12 @@ curl http://127.0.0.1:8791/v1/chat/completions \
 
 - `model` 走别名解析（默认 `qwen=qwen3.8-flash`、`ds=deepseek-v4-flash-0731`；kimi 系只在 Web agent 通道有，兼容通道不提供，别配）
 - `max_completion_tokens` 归一成 `max_tokens`
-- 客户端没给 `max_tokens` 时**不注入**（`default_max_tokens=0` 跟随上游），避免思考模型的预算被 800 掐死
+- 客户端没给 `max_tokens` 时注入 `default_max_tokens`：`0`（默认）= 自动 4096，正数 = 指定值，`-1` = 完全不注入、跟随上游。
+  自动值的由来：24 小时日志里 18 次 `200` 但正文为空，形态清一色 `finish_reason=length` + `reasoning_content` 有内容
+  —— 思考 token 把预算烧光了；这些请求多数没传 `max_tokens`，4096 远低于目录上限 64000
+- `messages[].content` 体检：`input_text` 归一成 `text`；目录确认为纯文本的模型收到 `image_url` 本地拒；
+  `tool_result` / `thinking` / `audio` 等无法转发的类型本地拒。这三类在 24 小时日志里制造了 32/536 次无法归因的上游 400
+- 请求体上限 **1MiB**（与上游 bodyParser 实测上限对齐）：按 `Content-Length` 在入口就回 413，不让客户端先白传几百 KB
 - 非流式请求丢弃 `stream_options`
 - `n != 1` 直接报错，不做本地并发模拟
 
@@ -144,7 +149,9 @@ curl http://127.0.0.1:8791/v1/chat/completions \
 
 - 上游静默超过 `keepalive_sec`（默认 12s）补 `: keepalive` 注释帧，防止长思考被客户端判超时
 - 心跳与业务帧走同一条写路径，不会把一帧劈成两半
-- 上游没给 `finish_reason` 就断流，日志记为 `502`，不伪装成正常结束
+- 上游没给 `finish_reason` 但发过 `[DONE]` 且确有内容：按正常结束收尾，日志记 `200` + note。
+  DeepSeek 系经常只发 `[DONE]` 不标终止原因，把一段完整回答判 502 会让客户端丢掉已收到的文本
+- 没有 `[DONE]`、或整条流一个字都没吐：记 `502 stream_interrupted`，不伪装成正常结束
 
 ## 错误契约（对齐 chat-adapter 规范）
 
@@ -156,9 +163,12 @@ curl http://127.0.0.1:8791/v1/chat/completions \
 | 400 | `invalid_request_error` | `context_length_exceeded` | 上下文超限 |
 | 400 | `invalid_request_error` | `unsupported_parameter` | 参数不支持（如 `n>1`） |
 | 400 | `invalid_request_error` | `content_filter` | 内容安全拦截 |
+| 400 | `invalid_request_error` | `model_does_not_support_vision` | 给纯文本模型发了图片 |
+| 400 | `invalid_request_error` | `unsupported_content_type` | content 里有无法转发的类型 |
 | 401 | `authentication_error` | `invalid_api_key` | 鉴权失败 |
 | 403 | `permission_error` | `permission_denied` | 权限不足 |
 | 404 | `not_found_error` | `not_found` | 模型/资源不存在 |
+| 413 | `invalid_request_error` | `request_too_large` | 请求体超过 1MiB（上游 bodyParser 上限） |
 | 429 | `rate_limit_error` | `insufficient_quota` | 余额或额度不足 |
 | 429 | `rate_limit_error` | `rate_limit_exceeded` | 限流，可退避 |
 | 502 | `api_error` | `connection_error` | 连不上上游 |

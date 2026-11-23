@@ -183,18 +183,28 @@ func (l *Log) Recent(f Filter) []Entry {
 }
 
 // Stats 汇总最近窗口内的成功/失败与耗时。
+//
+// 499 单独计数：那是客户端自己断开（常见于推理模型长回答超过客户端耐心），
+// 既不该算成功（会掩盖真实失败），也不该算网关失败（会冤枉服务）。单列最诚实，
+// 成功率的分母只含「网关切完的请求」。
 func (l *Log) Stats() map[string]any {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
-	var ok, errs int
+	var ok, errs, canceled int
 	var sumTTFB, sumDur, tokens int64
 	for _, e := range l.ring {
 		if e.Channel != "chat" {
 			continue
 		}
-		if e.Status >= 400 {
+		switch {
+		case e.Status == 499:
+			canceled++
+			continue
+		case e.Status >= 400, e.Status == 0:
+			// Status == 0 是历史脏数据（旧版本错误分支固定写 0）。
+			// 面板的判据是 >=400 为失败，0 会被当成成功，必须在这里兜住。
 			errs++
-		} else {
+		default:
 			ok++
 		}
 		sumTTFB += e.TTFB
@@ -211,7 +221,7 @@ func (l *Log) Stats() map[string]any {
 		rate = float64(ok) * 100 / float64(n)
 	}
 	return map[string]any{
-		"chat_ok": ok, "chat_err": errs, "success_rate": rate,
+		"chat_ok": ok, "chat_err": errs, "chat_canceled": canceled, "success_rate": rate,
 		"avg_ttfb_ms": avgTTFB, "avg_dur_ms": avgDur, "tokens": tokens,
 	}
 }

@@ -5,10 +5,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
+	"errors"
 	"io"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -25,8 +26,8 @@ type Handler struct {
 	St      *store.Store
 	Picker  *pool.Picker
 	Catalog *catalog.Service
-	Up      *upstream.Client    // 默认（meoo）客户端；Reg 未接线时的兜底
-	Reg     *upstream.Registry  // 全部供应商；nil 时等价只有 Up
+	Up      *upstream.Client   // 默认（meoo）客户端；Reg 未接线时的兜底
+	Reg     *upstream.Registry // 全部供应商；nil 时等价只有 Up
 	Log     *reqlog.Log
 }
 
@@ -45,7 +46,16 @@ type caller struct {
 	ClientID string
 }
 
-const maxBody = 16 << 20
+// maxBody 是允许通过网关的最大请求体，必须与上游 bodyParser 的上限对齐。
+//
+// 实测（2026-11-23，直连 compatible-mode，用不存在的模型做探针，bodyParser 先于
+// 模型校验）：1000KB 通过（回 MODEL_NOT_SUPPORTED），1MB+603 字节被 413
+// PayloadTooLargeError 拒 —— 上限就是 1MiB，判据是 Content-Length。
+//
+// 之前这里放行 16MB：客户端得先把几 MB 传完（家宽上行实测约 22KB/s，1MB 要 47 秒）
+// 才换回一个必然失败的 413；超过 16MB 更糟，被 LimitReader 截断后 json.Unmarshal
+// 失败，会误报成 400 invalid_request。
+const maxBody = 1 << 20
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -184,9 +194,22 @@ func (h *Handler) chat(w http.ResponseWriter, r *http.Request) {
 		failSpec(w, "authentication", "")
 		return
 	}
-	raw, err := io.ReadAll(io.LimitReader(r.Body, maxBody))
+	// 体积预检走 Content-Length：上游 bodyParser 也是这么判的，
+	// 早拒一秒，客户端就不用白传几百 KB 上行。
+	if r.ContentLength > maxBody {
+		w.Header().Set("X-Meoo-Max-Body", strconv.Itoa(maxBody))
+		writeSpec(w, specs["request_too_large"], "")
+		return
+	}
+	raw, err := io.ReadAll(io.LimitReader(r.Body, maxBody+1))
 	if err != nil {
 		failSpec(w, "invalid_request", "")
+		return
+	}
+	if len(raw) > maxBody {
+		// chunked 请求没有 Content-Length，只能读完再判。
+		w.Header().Set("X-Meoo-Max-Body", strconv.Itoa(maxBody))
+		writeSpec(w, specs["request_too_large"], "")
 		return
 	}
 	var body map[string]any
@@ -223,13 +246,29 @@ func (h *Handler) chat(w http.ResponseWriter, r *http.Request) {
 	}
 	stream, _ := body["stream"].(bool)
 
+	// 内容体检：input_text 归一化、图片给纯文本模型本地拒、不支持的类型本地拒。
+	// 必须在拿到 resolved 之后（图片支持度取决于模型），在 shapeRequest 之前。
+	visionOK, visionKnown := h.visionCapability(resolved)
+	if cerr := normalizeMessages(msgs, visionOK, visionKnown); cerr != nil {
+		// 本地拒绝也要落日志：这些请求根本不会打上游，不记就在运行日志里彻底消失，
+		// 面板只会看到上游错误率下降、却不知道流量被谁拦下了。
+		ms := time.Since(started).Milliseconds()
+		h.logEntry(r, cl, nil, resolved, http.StatusBadRequest, stream, started, ms, ms, nil, cerr, false)
+		if ce, ok := cerr.(*contentError); ok {
+			writeSpec(w, specs[ce.spec], ce.param)
+			return
+		}
+		failSpec(w, "invalid_request", "messages")
+		return
+	}
+
 	h.St.Mu.RLock()
 	defMax := h.St.Data.Config.DefaultMaxTokens
 	timeoutSec := h.St.Data.Config.RequestTimeoutSec
 	failover := h.St.Data.Config.Failover
 	h.St.Mu.RUnlock()
 	if timeoutSec <= 0 {
-		timeoutSec = 180
+		timeoutSec = 240
 	}
 
 	out, err := shapeRequest(body, resolved, defMax, stream)
@@ -306,11 +345,22 @@ func (h *Handler) proxyJSON(ctx context.Context, w http.ResponseWriter, body map
 	up := h.ClientFor(key)
 	code, raw, err := up.DoJSON(ctx, http.MethodPost, up.Base+"/chat/completions", body, upstream.MergeHeader(key.Key, nil))
 	if err != nil {
-		h.logEntry(r, cl, key, resolved, 0, false, started, time.Since(started).Milliseconds(), time.Since(started).Milliseconds(), nil, err, retried)
+		ms := time.Since(started).Milliseconds()
+		h.logEntry(r, cl, key, resolved, statusOfErr(err), false, started, ms, ms, nil, err, retried)
 		return err
 	}
 	if code < 200 || code >= 300 {
-		return fmt.Errorf("上游返回 HTTP %d", code)
+		// DoJSON 已把非 2xx 折成 *upstream.Error，走到这里说明响应被别处改写过；
+		// 仍按状态码归一出错因，避免出现无法分类的裸 fmt.Errorf。
+		ue := &upstream.Error{Status: code, Message: "上游返回非 2xx"}
+		if code >= 500 {
+			ue.Kind = upstream.KindServer
+		} else {
+			ue.Kind = upstream.KindBadRequest // 4xx 换号只会重复请求，不重试
+		}
+		ms := time.Since(started).Milliseconds()
+		h.logEntry(r, cl, key, resolved, statusOfErr(ue), false, started, ms, ms, nil, ue, retried)
+		return ue
 	}
 	u := parseUsage(raw)
 	h.Picker.MarkOK(key.ID, resolved, u.total)
@@ -417,8 +467,10 @@ func shapeRequest(body map[string]any, resolved string, defMax int, stream bool)
 		}
 		delete(out, "max_completion_tokens")
 	}
-	if _, ok := out["max_tokens"]; !ok && defMax > 0 {
-		out["max_tokens"] = defMax
+	if _, ok := out["max_tokens"]; !ok {
+		if b := autoBudget(defMax); b > 0 {
+			out["max_tokens"] = b
+		}
 	}
 	if n, ok := out["n"]; ok {
 		switch f := n.(type) {
@@ -449,6 +501,51 @@ type gwErr string
 func (e gwErr) Error() string { return string(e) }
 
 const errNNotSupported = gwErr("当前实现仅支持 n=1")
+
+// autoBudgetDefault 是「客户端没给 max_tokens」时注入的默认预算。
+//
+// 为什么需要它：24 小时运行日志里有 18 次 HTTP 200 但正文为空，形态清一色
+// finish_reason=length + reasoning_content 有内容 —— 推理模型的思考 token 把预算
+// 烧光了，正文一个字都没输出。这类请求多半压根没传 max_tokens，拿到的是上游一个
+// 很小的默认值。服务端为「未指定预算」的请求给出合理默认值，本来就是兼容网关的
+// 职责（OpenAI 自己也有默认值），而 4096 远低于目录里的 max_tokens=64000 上限。
+const autoBudgetDefault = 4096
+
+// autoBudget 折算最终预算：
+//
+//	configured > 0 → 用户显式配置值
+//	configured = 0 → autoBudgetDefault（0 的语义从「跟随上游」改为「自动」）
+//	configured < 0 → 0，表示不注入，完全跟随上游（逃生阀）
+func autoBudget(configured int) int {
+	if configured < 0 {
+		return 0
+	}
+	if configured > 0 {
+		return configured
+	}
+	return autoBudgetDefault
+}
+
+// statusOfErr 把一次失败折算成客户端实际会收到的 HTTP 状态。
+//
+// 日志必须记真实状态：之前所有错误分支一律写 0，而面板的判定是
+// status >= 400 为失败、否则为成功 —— 于是 24 小时里 40 次失败（含 28 次 400、
+// 4 次 413、3 次 504）在面板上全显示成绿色 0，成功率虚高到 93%。
+func statusOfErr(err error) int {
+	if err == nil {
+		return http.StatusOK
+	}
+	// 客户端自己断开（499）不能被算成网关的 502：错误率会虚高，
+	// 而且面板的「失败」筛选里全是客户端没耐心，反而盖住真实故障。
+	var ue *upstream.Error
+	if errors.As(err, &ue) && ue.Kind == upstream.KindCanceled {
+		return 499
+	}
+	if errors.Is(err, context.Canceled) {
+		return 499
+	}
+	return specOf(err).Status
+}
 
 // completionNote 识别"HTTP 200 但正文为空"的可疑形态。
 // 最常见的原因：推理模型的思考 token 也算进 max_tokens，

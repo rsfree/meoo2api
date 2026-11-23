@@ -884,9 +884,10 @@ func (h *Handler) configUpdate(w http.ResponseWriter, r *http.Request) {
 	h.St.Mu.Lock()
 	c := &h.St.Data.Config
 	if in.DefaultMaxTokens != nil {
-		if *in.DefaultMaxTokens < 0 {
+		// -1 = 不注入（完全跟随上游），0 = 自动（4096），正数 = 指定值。
+		if *in.DefaultMaxTokens < -1 {
 			h.St.Mu.Unlock()
-			writeErr(w, 400, "bad_value", "default_max_tokens 不能为负")
+			writeErr(w, 400, "bad_value", "default_max_tokens 只能是 -1（跟随上游）、0（自动 4096）或正数")
 			return
 		}
 		c.DefaultMaxTokens = *in.DefaultMaxTokens

@@ -992,7 +992,7 @@ function viewUsage() {
     <div class="stat"><div class="v">${nf(tokens)}</div><div class="k">采样覆盖 tokens</div></div>
     <div class="stat warn"><div class="v">${nf(spent)}<small> 分</small></div><div class="k">已花积分</div></div>
     <div class="stat hl"><div class="v">${rate ? nf(rate) : "—"}</div><div class="k">tok / 分（实测）</div></div>
-    <div class="stat"><div class="v">${nf(st.chat_ok)}<small>/ ${nf(st.chat_err)}</small></div><div class="k">成功 / 失败</div></div>
+    <div class="stat" title="客户端主动断开（499）${nf(st.chat_canceled)} 次，不计入成功率"><div class="v">${nf(st.chat_ok)}<small>/ ${nf(st.chat_err)}</small></div><div class="k">成功 / 失败</div></div>
     <div class="stat"><div class="v">${nf(st.avg_ttfb_ms)}<small> ms</small></div><div class="k">平均首字节</div></div>
   </div>
 
@@ -1190,8 +1190,8 @@ function viewConfig() {
     <div class="pad">
       <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:0 18px">
         <label class="fld"><span class="lb">默认 max_tokens</span>
-          <input id="cMax" type="number" min="0" value="${c.default_max_tokens ?? 0}">
-          <span class="hint">0 = 跟随上游，不额外限制</span></label>
+          <input id="cMax" type="number" min="-1" value="${c.default_max_tokens ?? 0}">
+          <span class="hint">0 = 自动 4096（防推理模型思考耗尽正文为空）；-1 = 完全跟随上游；正数 = 指定值</span></label>
         <label class="fld"><span class="lb">上游超时（秒）</span>
           <input id="cTimeout" type="number" min="30" max="900" value="${c.request_timeout_sec || 180}">
           <span class="hint">30–900；推理模型首帧慢，别低于 180</span></label>
@@ -1632,7 +1632,7 @@ async function loadLogs() {
       <td class="hint nw">${hms(e.t)}</td>
       <td class="hint opt">${esc(e.ch || "chat")}</td>
       <td class="mono">${esc(e.model || "—")}</td>
-      <td>${e.status >= 400 ? `<span class="tag bad">${e.status}</span>` : e.note ? `<span class="tag warn">${e.status}</span>` : `<span class="tag ok">${e.status}</span>`}</td>
+      <td>${(!e.status || e.status >= 400) ? `<span class="tag bad">${e.status || "err"}</span>` : e.note ? `<span class="tag warn">${e.status}</span>` : `<span class="tag ok">${e.status}</span>`}</td>
       <td class="num opt">${e.ttfb_ms || 0} ms</td>
       <td class="num">${nf(e.dur_ms)} ms</td>
       <td class="num opt">${nf(e.total_tokens)}</td>

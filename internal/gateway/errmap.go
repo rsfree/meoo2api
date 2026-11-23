@@ -28,8 +28,12 @@ type Spec struct {
 }
 
 var specs = map[string]Spec{
-	"invalid_request":       {400, "invalid_request_error", "invalid_request", "The request is invalid. Check the request parameters.", false},
-	"context_length":        {400, "invalid_request_error", "context_length_exceeded", "The request exceeds the model context length. Reduce the input or output length.", false},
+	"invalid_request": {400, "invalid_request_error", "invalid_request", "The request is invalid. Check the request parameters.", false},
+	"context_length":  {400, "invalid_request_error", "context_length_exceeded", "The request exceeds the model context length. Reduce the input or output length.", false},
+	// vision_unsupported：目录已确认该模型只吃文本，客户端却发了图片。
+	// 单独给码是为了让客户端能自动改道（换多模态模型 / 去掉图片），而不是死在一句「请求无效」上。
+	"vision_unsupported":    {400, "invalid_request_error", "model_does_not_support_vision", "This model accepts text only. Remove the image content or switch to a multimodal model.", false},
+	"content_unsupported":   {400, "invalid_request_error", "unsupported_content_type", "The messages contain a content type this gateway cannot forward. Use text or image_url items.", false},
 	"unsupported_parameter": {400, "invalid_request_error", "unsupported_parameter", "A request parameter is not supported. Remove or replace it.", false},
 	"content_filter":        {400, "invalid_request_error", "content_filter", "The request was rejected by content safety checks.", false},
 	"request_too_large":     {413, "invalid_request_error", "request_too_large", "The request is too large. Reduce its size.", false},

@@ -28,17 +28,24 @@ func TestShapeRejectsN(t *testing.T) {
 	}
 }
 
-func TestShapeDoesNotInjectMaxTokensWhenZero(t *testing.T) {
+// 0 的语义是「自动」：注入 4096 而不是跟随上游。
+// 24 小时日志里 18 次 HTTP 200 但正文为空，全是推理模型思考把预算烧光；
+// 这些请求大多没传 max_tokens，上游默认值太小。要回到旧行为把配置设成 -1。
+func TestShapeAutoBudgetDefault(t *testing.T) {
 	out, err := shapeRequest(decode(t, `{"model":"q","messages":[{"role":"user","content":"a"}]}`), "qwen3.8-flash", 0, false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, has := out["max_tokens"]; has {
-		t.Fatal("default_max_tokens=0 时不得注入 max_tokens（会掐死思考模型）")
+	if out["max_tokens"] != 4096 {
+		t.Fatalf("0 应注入 4096，得到 %v", out["max_tokens"])
 	}
 	out2, _ := shapeRequest(decode(t, `{"model":"q"}`), "qwen3.8-flash", 4096, false)
 	if out2["max_tokens"] != 4096 {
 		t.Fatalf("配置了默认值应注入，得到 %v", out2["max_tokens"])
+	}
+	out3, _ := shapeRequest(decode(t, `{"model":"q"}`), "qwen3.8-flash", -1, false)
+	if _, has := out3["max_tokens"]; has {
+		t.Fatalf("-1 表示跟随上游，不应注入，得到 %v", out3["max_tokens"])
 	}
 }
 

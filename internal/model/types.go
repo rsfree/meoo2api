@@ -129,8 +129,8 @@ type ClientKey struct {
 
 // Config 是热生效的运行时配置。
 type Config struct {
-	DefaultMaxTokens  int               `json:"default_max_tokens"`  // 0 = 跟随上游
-	RequestTimeoutSec int               `json:"request_timeout_sec"` // 默认 180
+	DefaultMaxTokens  int               `json:"default_max_tokens"`  // -1 = 跟随上游；0 = 自动 4096；正数 = 指定值
+	RequestTimeoutSec int               `json:"request_timeout_sec"` // 默认 240
 	QuotaCooldownSec  int               `json:"quota_cooldown_sec"`  // 余额不足冷却，默认 1800
 	RateCooldownSec   int               `json:"rate_cooldown_sec"`   // 限流冷却，默认 600
 	Failover          bool              `json:"failover"`            // 自动换号
@@ -160,7 +160,7 @@ type Data struct {
 func DefaultConfig() Config {
 	return Config{
 		DefaultMaxTokens:  0,
-		RequestTimeoutSec: 180,
+		RequestTimeoutSec: 240,
 		QuotaCooldownSec:  1800,
 		RateCooldownSec:   600,
 		Failover:          true,

@@ -184,19 +184,25 @@ func parseBusinessEnvelope(raw []byte) error {
 	if json.Unmarshal(trimmed, &a) != nil || a.Success == nil || *a.Success {
 		return nil
 	}
-	return &Error{Status: http.StatusOK, Code: a.ErrCode, Message: a.Message, Kind: classifyBusiness(a.ErrCode, a.Message)}
+	return &Error{Status: http.StatusOK, Code: a.ErrCode, Message: a.Message, Kind: ClassifyBusiness(a.ErrCode, a.Message)}
 }
 
-// classifyBusiness 按业务错误码/文案推断处置动作。
-func classifyBusiness(code, msg string) string {
+// ClassifyBusiness 按业务错误码/文案推断处置动作。
+//
+// 导出是为了让 gateway 处理「HTTP 200 但首帧就是 error 对象」时复用同一套判据：
+// 之前那类错误被硬编码成 KindBadRequest，于是一条夹在 SSE 里的限流/额度错误
+// 既不会被换号重试，也不会以 429 返回给客户端，而是变成 502 upstream_error。
+func ClassifyBusiness(code, msg string) string {
 	u := strings.ToUpper(code + " " + msg)
 	switch {
 	case strings.Contains(u, "QUOTA"), strings.Contains(msg, "余额"), strings.Contains(msg, "额度"), strings.Contains(msg, "积分不足"):
 		return KindQuota
-	case strings.Contains(u, "AUTH"), strings.Contains(u, "TOKEN"), strings.Contains(u, "LOGIN"), strings.Contains(u, "UNAUTHORIZED"):
-		return KindAuth
+	case strings.Contains(u, "OVERLOAD"), strings.Contains(u, "TOOBUSY"), strings.Contains(msg, "繁忙"):
+		return KindServer
 	case strings.Contains(u, "RATE"), strings.Contains(u, "LIMIT"), strings.Contains(u, "FREQUENT"), strings.Contains(msg, "频繁"):
 		return KindRate
+	case strings.Contains(u, "AUTH"), strings.Contains(u, "TOKEN"), strings.Contains(u, "LOGIN"), strings.Contains(u, "UNAUTHORIZED"):
+		return KindAuth
 	}
 	return KindBadRequest
 }

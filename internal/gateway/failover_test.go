@@ -12,6 +12,7 @@ import (
 	"meoo2api/internal/catalog"
 	"meoo2api/internal/model"
 	"meoo2api/internal/pool"
+	"meoo2api/internal/reqlog"
 	"meoo2api/internal/store"
 	"meoo2api/internal/upstream"
 )
@@ -107,7 +108,12 @@ func harness(t *testing.T, keys map[string]model.Health) (*Handler, *fakeUpstrea
 	up := upstream.New(f.srv.URL + "/v1")
 	pk := &pool.Picker{St: st, Up: up}
 	cat := catalog.New(st, pk, up)
-	return &Handler{St: st, Picker: pk, Catalog: cat, Up: up}, f, st
+	lg, err := reqlog.Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("reqlog.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = lg.Close() })
+	return &Handler{St: st, Picker: pk, Catalog: cat, Up: up, Log: lg}, f, st
 }
 
 func chatReq(gw *Handler, body string) *httptest.ResponseRecorder {

@@ -23,7 +23,7 @@ func (h *Handler) proxyStream(ctx context.Context, w http.ResponseWriter, body m
 	resp, err := up.DoStream(ctx, up.Base+"/chat/completions", body, upstream.MergeHeader(key.Key, nil))
 	if err != nil {
 		ms := time.Since(started).Milliseconds()
-		h.logEntry(r, cl, key, resolved, 0, true, started, ms, ms, nil, err, retried)
+		h.logEntry(r, cl, key, resolved, statusOfErr(err), true, started, ms, ms, nil, err, retried)
 		return err
 	}
 	defer resp.Body.Close()
@@ -75,19 +75,26 @@ func (h *Handler) proxyStream(ctx context.Context, w http.ResponseWriter, body m
 			flusher.Flush()
 		}
 	}
+	// fail 记一条日志再返回：首帧阶段失败时响应头还没发，chat() 若判定不可重试会
+	// 直接 failErr，之前这些请求（内容过滤、首帧限流）在运行日志里完全不存在。
+	fail := func(err error) error {
+		ms := time.Since(started).Milliseconds()
+		h.logEntry(r, cl, key, resolved, statusOfErr(err), true, started, ms, ms, nil, err, retried)
+		return err
+	}
 	for i := 0; i < 3; i++ {
 		ln, ok := <-ch
 		if !ok {
 			if len(pending) == 0 {
-				return &upstream.Error{Kind: upstream.KindServer, Message: "上游在首帧前关闭连接"}
+				return fail(&upstream.Error{Kind: upstream.KindServer, Message: "上游在首帧前关闭连接"})
 			}
 			break
 		}
 		if ln.err != nil {
-			return ln.err
+			return fail(ln.err)
 		}
 		if e := streamErrorOf(ln.text); e != nil {
-			return e
+			return fail(e)
 		}
 		pending = append(pending, ln.text)
 		if strings.HasPrefix(strings.TrimSpace(ln.text), "data:") {
@@ -135,15 +142,37 @@ func (h *Handler) proxyStream(ctx context.Context, w http.ResponseWriter, body m
 			if !ok {
 				h.Picker.MarkOK(key.ID, resolved, u.total)
 				if !gotFinish {
-					// 只有 EOF 或只有 [DONE]（seenDone）而没有 finish_reason：不算成功。
-					_ = seenDone
+					// 上游没给 finish_reason。两种情况必须分开：
+					//
+					//  1) 收到了 [DONE] 且确实有输出 —— 上游认为这一轮结束了，只是没标
+					//     终止原因（DeepSeek 系常见）。内容已经完整交付给客户端，此时再补
+					//     一帧 502 会把一段可用的回答判死，客户端还会丢掉已收到的文本。
+					//     24 小时日志里 8 次「流缺少语义终态」全部属于这一类。
+					//
+					//  2) 没有 [DONE]，或压根没吐出任何内容 —— 真中断，按契约报 502。
+					if seenDone && (contentLen > 0 || reasoningLen > 0) {
+						_, _ = w.Write([]byte("data: [DONE]\n\n"))
+						if flusher != nil {
+							flusher.Flush()
+						}
+						h.logEntryNote(r, cl, key, resolved, 200, true, started,
+							ttfbOrZero(ttfb, started), time.Since(started).Milliseconds(), u, nil, retried,
+							"上游未给 finish_reason，但有 [DONE] 与完整内容，已按正常结束收尾")
+						return nil
+					}
 					spec := specs["stream_interrupted"]
 					_, _ = w.Write(sseErrorFrame(spec))
 					_, _ = w.Write([]byte("data: [DONE]\n\n"))
 					if flusher != nil {
 						flusher.Flush()
 					}
-					h.logEntry(r, cl, key, resolved, spec.Status, true, started, ttfbOrZero(ttfb, started), time.Since(started).Milliseconds(), u, &upstream.Error{Kind: upstream.KindServer, Message: "流缺少语义终态"}, retried)
+					reason := "流缺少语义终态"
+					if !seenDone {
+						reason = "流在 [DONE] 前结束"
+					} else if contentLen == 0 && reasoningLen == 0 {
+						reason = "流无任何内容产出"
+					}
+					h.logEntry(r, cl, key, resolved, spec.Status, true, started, ttfbOrZero(ttfb, started), time.Since(started).Milliseconds(), u, &upstream.Error{Kind: upstream.KindServer, Message: reason}, retried)
 					return nil
 				}
 				_, _ = w.Write([]byte("data: [DONE]\n\n"))
@@ -158,6 +187,11 @@ func (h *Handler) proxyStream(ctx context.Context, w http.ResponseWriter, body m
 				return nil
 			}
 			if ln.err != nil {
+				if statusOfErr(ln.err) == 499 {
+					// 客户端断开导致的读错误：写帧也没人收，只记账。
+					h.logEntry(r, cl, key, resolved, 499, true, started, ttfbOrZero(ttfb, started), time.Since(started).Milliseconds(), u, nil, retried)
+					return nil
+				}
 				// 头已发出，状态码不可改：按契约补一帧公开 error，再 [DONE]。
 				spec := specOf(ln.err)
 				_, _ = w.Write(sseErrorFrame(spec))
@@ -236,7 +270,10 @@ func streamErrorOf(lineText string) *upstream.Error {
 	case float64:
 		code = fmt.Sprintf("%v", c)
 	}
-	return &upstream.Error{Status: http.StatusOK, Code: code, Message: e.Message, Kind: upstream.KindBadRequest}
+	// 首帧 error 的处置动作要与普通上游错误一致：限流/额度/过载要能换号，
+	// 参数错误才直接返回。硬编码 KindBadRequest 会让可恢复的错误一张口就死。
+	return &upstream.Error{Status: http.StatusOK, Code: code, Message: e.Message,
+		Kind: upstream.ClassifyBusiness(code, e.Message)}
 }
 
 // scanChunk 从单个 SSE data 帧里取 usage 与 finish_reason。
