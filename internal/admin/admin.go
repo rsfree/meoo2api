@@ -147,6 +147,12 @@ func (h *Handler) route(w http.ResponseWriter, r *http.Request, path string) boo
 	case path == "/admin/api/catalog/refresh":
 		h.Catalog.Refresh(r.Context())
 		writeJSON(w, 200, map[string]any{"ok": true, "status": h.Catalog.Status()})
+	case path == "/admin/api/tasks/overview":
+		h.tasksOverview(w, r)
+	case path == "/admin/api/tasks/checkin":
+		h.tasksCheckin(w, r)
+	case path == "/admin/api/tasks/invite":
+		h.tasksInvite(w, r)
 	case path == "/admin/api/test":
 		h.test(w, r)
 	default:
@@ -175,6 +181,9 @@ func (h *Handler) state(w http.ResponseWriter, r *http.Request) {
 			"personal_ak": model.Mask(a.PersonalAK), "has_personal_ak": a.PersonalAK != "",
 			"project_id": a.ProjectID, "points": a.Points, "points_at": a.PointsAt,
 			"last_error": a.LastError, "last_check_at": a.LastCheckAt, "check_ok": a.CheckOK,
+			"has_cookie": a.Cookie != "",
+			"checkin_at": a.CheckinAt, "checkin_date": a.CheckinDate,
+			"checkin_amount": a.CheckinAmount, "checkin_err": a.CheckinErr,
 			"keys": keys,
 		})
 	}
@@ -673,6 +682,8 @@ func (h *Handler) configUpdate(w http.ResponseWriter, r *http.Request) {
 		Aliases           *map[string]string `json:"aliases"`
 		AliasNotes        *map[string]string `json:"alias_notes"`
 		HiddenModels      *[]string          `json:"hidden_models"`
+		CheckinAuto       *bool              `json:"checkin_auto"`
+		CheckinTime       *string            `json:"checkin_time"`
 		NewPassword       string             `json:"new_password"`
 	}
 	if err := decodeJSON(r, &in); err != nil {
@@ -734,6 +745,23 @@ func (h *Handler) configUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 	if in.HiddenModels != nil {
 		c.HiddenModels = *in.HiddenModels
+	}
+	if in.CheckinAuto != nil {
+		c.CheckinAuto = *in.CheckinAuto
+	}
+	if in.CheckinTime != nil {
+		v := strings.TrimSpace(*in.CheckinTime)
+		if v == "" {
+			v = "09:00"
+		}
+		var hh, mm int
+		if _, err := fmt.Sscanf(v, "%d:%d", &hh, &mm); err != nil || hh < 0 || hh > 23 || mm < 0 || mm > 59 {
+			h.St.Mu.Unlock()
+			writeErr(w, 400, "bad_value", "自动签到时刻需形如 09:00")
+			return
+		}
+		// 统一成补零格式：面板里显示和比较都靠它
+		c.CheckinTime = fmt.Sprintf("%02d:%02d", hh, mm)
 	}
 	if in.NewPassword != "" {
 		if len(in.NewPassword) < 8 {

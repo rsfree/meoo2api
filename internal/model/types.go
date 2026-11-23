@@ -41,6 +41,14 @@ type Account struct {
 
 	KeyIDs []string `json:"key_ids,omitempty"`
 
+	// 每日签到：Meoo 没有手动签到按钮，「签到」= 用网页登录态领当天的登录赠送积分。
+	// 只有 Cookie 能领（AK 被 API_KEY_ROUTE_FORBIDDEN 拒绝），所以签到结果必须落盘，
+	// 否则面板刷新一次就忘了昨天领没领。
+	CheckinAt     int64   `json:"checkin_at,omitempty"`     // 最近一次签到尝试（含失败）
+	CheckinDate   string  `json:"checkin_date,omitempty"`   // 最近一次成功签到的日期（CST，YYYY-MM-DD）
+	CheckinAmount float64 `json:"checkin_amount,omitempty"` // 该次领到的积分
+	CheckinErr    string  `json:"checkin_err,omitempty"`    // 最近一次失败原因
+
 	// 成本观测：按模型累计 token，配合积分快照反推真实单价。
 	Usage         map[string]int64 `json:"usage,omitempty"`
 	Spent         int64            `json:"spent,omitempty"`          // 累计积分消耗（采样得出）
@@ -105,6 +113,11 @@ type Config struct {
 	AliasNotes        map[string]string `json:"alias_notes,omitempty"` // 别名备注，仅面板展示用
 	HiddenModels      []string          `json:"hidden_models,omitempty"`
 	AdminPass         string            `json:"admin_pass,omitempty"` // pbkdf2 编码
+
+	// 每日自动签到：到点后用各账号的网页 Cookie 领登录赠送积分。
+	// 默认关闭——Cookie 有寿命（阿里 SSO ≤2 天），自动跑失败只会留一串错误。
+	CheckinAuto bool   `json:"checkin_auto"`
+	CheckinTime string `json:"checkin_time,omitempty"` // HH:MM，默认 09:00
 }
 
 // Data 是整个状态树的根。
@@ -127,6 +140,7 @@ func DefaultConfig() Config {
 		Failover:          true,
 		KeepaliveSec:      12,
 		Aliases:           map[string]string{"qwen": "qwen3.8-flash", "ds": "deepseek-v4-flash-0731"},
+		CheckinTime:       "09:00",
 	}
 }
 

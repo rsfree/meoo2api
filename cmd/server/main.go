@@ -159,6 +159,8 @@ func run() error {
 	catalogDone := cat.Start(ctx)
 	healthDone := acc.HealthLoop(ctx, time.Hour)
 	costDone := acc.CostLoop(ctx, 5*time.Minute)
+	// 自动签到：每分钟看一眼是否过了配置的时刻（补签式，重启也不会漏当天）。
+	checkinDone := acc.CheckinLoop(ctx, time.Minute)
 	saveDone := make(chan struct{})
 	go func() {
 		defer close(saveDone)
@@ -193,6 +195,7 @@ func run() error {
 	<-catalogDone
 	<-healthDone
 	<-costDone
+	<-checkinDone
 	<-saveDone
 	if serr := st.Save(); serr != nil {
 		return fmt.Errorf("保存最终状态: %w", serr)

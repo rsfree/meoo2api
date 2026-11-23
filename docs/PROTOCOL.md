@@ -140,6 +140,59 @@ GET https://meoo.com/open/v1/cli-compat/projects/{url_id}/cloud/environment
 
 ---
 
+## 三点五、积分与增长（Cookie 专属，抓包 2026-11-23）
+
+这两组接口只认网页 Cookie，个人 AK 调用一律 `403 API_KEY_ROUTE_FORBIDDEN`，
+所以它们构成了「任务中心」的全部上游能力。
+
+### 每日登录赠送（即"签到"）
+
+```http
+GET https://meoo.com/api/mc/entitlement/init
+Cookie: …
+Referer: https://meoo.com/
+```
+
+```json
+{"success":true,"data":{"initialized":true,"dailyLoginGranted":true,"dailyLoginGrantAmount":2000,"inviteRewardArrivals":[]}}
+```
+
+- 前端在应用 ready 时自动调一次（`sn.initEntitlement()`），**页面上没有签到按钮**
+- 同一天重复调用幂等：`dailyLoginGranted=false`、金额 0
+- 未登录：`401 {"success":false,"errCode":"NEED_LOGIN"}`
+
+签到状态不必依赖 Cookie：AK 读 `/open/v1/cli-compat/account/points`，看
+`activeGrants[sourceType=DAILY_LOGIN].grantDetails[].effectiveDate` 里有没有今天的日期即可。
+批次形如：
+
+```json
+{"sourceType":"DAILY_LOGIN","totalInitialAmount":4000,"totalRemainingAmount":2052,
+ "grantDetails":[{"remainingAmount":2000,"effectiveDate":"2026-11-21T00:42:47.046","expiresDate":"2026-11-27T23:59:59"}]}
+```
+
+`effectiveDate` 是不带时区的东八区墙钟时间；每日批次 7 天过期，先到期先扣。
+
+### 邀请
+
+```http
+GET  https://meoo.com/api/growth/invite/myCard
+POST https://meoo.com/api/growth/invite/generate
+```
+
+```json
+{"success":true,"data":{"code":"AB12CD34","expiresAt":"2027-01-31T23:59:59",
+ "stats":{"registeredCount":12,"subscribedCount":4,"totalRewardPoints":140000,"riskPendingCount":0},
+ "rewardConfig":{"registerRewardInviter":5000,"registerRewardInvitee":5000,
+   "firstPaidReward":10000,"firstPaidPurchaseWindowDays":7,"firstPaidDelayDays":5}}}
+```
+
+- 分享链接 = `https://meoo.com/?inviteCode=<code>`（前端 `kQ(code)` 同款拼法）
+- **未登录也返回 200**，只是 `code/stats` 为 `null`、`rewardConfig` 照常给 —— 所以判断"掉线"必须先看
+  `/api/v1/user/me` 的 `data.user_id`，只看状态码会把掉线当成"还没生成邀请码"
+- 业务错误码：`INVITE_EDITION_NOT_SUPPORTED`（仅个人版可用）、`INVITE_BLACKLISTED`（被风控限制）
+
+---
+
 ## 四、Web agent 协议（备查，本项目未采用）
 
 页面加载后会拉一堆接口，核心是这几条：
