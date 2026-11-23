@@ -60,7 +60,8 @@ func (h *Handler) tasksCheckin(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) tasksInvite(w http.ResponseWriter, r *http.Request) {
 	var in struct {
 		ID     string `json:"id"`
-		Action string `json:"action"` // generate | card（默认）
+		Action string `json:"action"` // generate | set | card（默认）
+		Code   string `json:"code"`   // set 时必填
 	}
 	if err := decodeJSON(r, &in); err != nil {
 		writeErr(w, 400, "bad_request", "请求格式错误")
@@ -77,9 +78,12 @@ func (h *Handler) tasksInvite(w http.ResponseWriter, r *http.Request) {
 		out map[string]any
 		err error
 	)
-	if in.Action == "generate" {
+	switch in.Action {
+	case "generate":
 		out, err = h.Acc.InviteGenerate(ctx, in.ID)
-	} else {
+	case "set":
+		out, err = h.Acc.SetInviteCode(ctx, in.ID, in.Code)
+	default:
 		out, err = h.Acc.InviteCard(ctx, in.ID)
 	}
 	if err != nil {

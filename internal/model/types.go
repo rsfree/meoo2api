@@ -49,6 +49,13 @@ type Account struct {
 	CheckinAmount float64 `json:"checkin_amount,omitempty"` // 该次领到的积分
 	CheckinErr    string  `json:"checkin_err,omitempty"`    // 最近一次失败原因
 
+	// 邀请码：链接只是字符串拼接（https://meoo.com/?inviteCode=<code>），
+	// 读码却必须登录态，而且没有免登录的读取路径。所以拿到一次就落盘，
+	// Cookie 过期后照样能把链接发给别人。
+	InviteCode   string `json:"invite_code,omitempty"`
+	InviteExpAt  string `json:"invite_expires_at,omitempty"`
+	InviteCodeAt int64  `json:"invite_code_at,omitempty"` // 上次同步或手工设置的时间
+
 	// 成本观测：按模型累计 token，配合积分快照反推真实单价。
 	Usage         map[string]int64 `json:"usage,omitempty"`
 	Spent         int64            `json:"spent,omitempty"`          // 累计积分消耗（采样得出）

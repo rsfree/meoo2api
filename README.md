@@ -186,9 +186,19 @@ HTTP 状态兜底 → 502 upstream_error
 （`/open/v1/cli-compat/account/points` 的 `activeGrants[DAILY_LOGIN].grantDetails[].effectiveDate`）——
 AK 不会过期，所以哪怕 Cookie 已经死了，签到状态依然准确。连续天数也从这串日期算。
 
-邀请同理走 Cookie：`GET /api/growth/invite/myCard` 给邀请码、已注册 / 已订阅 / 已获得积分，
-`POST /api/growth/invite/generate` 生成邀请码，分享链接是 `https://meoo.com/?inviteCode=<code>`。
-掉线时面板仍会显示公开的奖励规则（这条接口匿名也能读到 `rewardConfig`），只是不显示你的邀请码。
+邀请的读取同样只能靠 Cookie：`GET /api/growth/invite/myCard` 给邀请码、已注册 / 已订阅 / 已获得积分，
+`POST /api/growth/invite/generate` 生成邀请码。但**链接本身不需要鉴权** ——
+`https://meoo.com/?inviteCode=<code>` 只是字符串拼接。所以面板把它拆成三层：
+
+| 层 | 依赖 | 掉线时 |
+|---|---|---|
+| 链接 | 只要知道邀请码 | 用本地缓存的码继续拼，照样能复制 |
+| 奖励规则 | 无（匿名接口就给 `rewardConfig`） | 照常显示 |
+| 统计数字 | 有效登录态 | 提示"需要登录态才能读" |
+
+码的来源有两条：登录态有效时自动从 `myCard` 读到并**落盘**（`invite_code` / `invite_expires_at`），
+或者手工在面板底部填一次。之所以留手工入口：实测项目 AK 读 `/api/v1/user/me` 也只会得到
+`data: null`，除了登录态没有任何免登录的读码路径；而链接又不需要鉴权，把两者绑在一起纯属自找麻烦。
 
 自动签到默认**关闭**（Cookie 有寿命，自动跑失败只会留一串错误）。要开就在「配置」里勾上并设时刻，
 判定方式是「过了时刻就补签」而不是「正好到点才签」——容器滚动、服务重启都不会漏掉当天，

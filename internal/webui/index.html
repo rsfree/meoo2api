@@ -160,6 +160,9 @@ label.fld > .hint { display: block; margin-top: 4px; }
   overflow: hidden; margin-bottom: 18px; box-shadow: var(--shadow);
 }
 @media (max-width: 1280px) { .stats { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+/* 正好四格的统计条不该被压成 3+1（那是给账号池 5~6 格留的规则） */
+@media (max-width: 1280px) { .stats.four { grid-template-columns: repeat(4, minmax(0, 1fr)); } }
+@media (max-width: 900px) { .stats.four { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 .stat { padding: 13px 16px; border-right: 1px solid var(--line-soft); border-bottom: 1px solid var(--line-soft); min-width: 0; }
 .stat .v {
   font: 600 25px/1.15 var(--mono); font-variant-numeric: tabular-nums; letter-spacing: -.02em;
@@ -1302,7 +1305,7 @@ async function saveConfig(btn, withPassword) {
 let TASK = null;
 let TASK_ERR = "";
 let TASK_LOADING = false;
-let TASK_INV = { id: "", card: null, err: "", busy: false, tried: "" };
+let TASK_INV = { id: "", card: null, err: "", busy: false, tried: "", draft: null };
 
 function taskRows() { return (TASK && TASK.accounts) || []; }
 function taskSignedCount() { return taskRows().filter((r) => r.today_signed).length; }
@@ -1345,7 +1348,7 @@ function viewTasks() {
   const autoOn = !!cfg.checkin_auto;
 
   return `
-  <div class="stats">
+  <div class="stats four">
     <div class="stat ${signed ? "good" : ""}"><div class="v">${signed}<small>/${rows.length}</small></div><div class="k">今日已签到</div></div>
     <div class="stat hl"><div class="v">${nf(bal)}</div><div class="k">号池积分余额</div></div>
     <div class="stat"><div class="v">${streak}<small> 天</small></div><div class="k">最长连续签到</div></div>
@@ -1484,38 +1487,42 @@ function viewInvite() {
   const card = TASK_INV.card || {};
   const st = card.stats || null;
   const rc = card.reward_config || null;
+  const draft = TASK_INV.draft != null ? TASK_INV.draft : (card.code || "");
+  const stale = !!card.stale;
 
+  /* 链接、统计、规则是三层：链接只要有码就能拼（不鉴权），统计必须登录态。
+     所以有码时永远先给链接，登录态坏了只降级掉统计，不能把整张卡打空。 */
   let body;
   const notTried = !TASK_INV.card && !TASK_INV.err && !TASK_INV.tried;
   if (TASK_INV.busy || notTried) {
     body = `<div class="pad"><div class="progress" style="max-width:260px"><i></i></div><div class="hint" style="margin-top:8px">正在向上游读取邀请信息…</div></div>`;
-  } else if (TASK_INV.err || !card.link) {
-    const why = TASK_INV.err || "还没有专属邀请码";
+  } else if (card.link) {
     body = `<div class="pad">
-      <div class="state bad" style="margin-bottom:10px"><span class="pulse bad"></span><span>${esc(why)}</span></div>
-      <div style="display:flex;gap:8px;flex-wrap:wrap">
-        ${row.cookie_ok
-          ? `<button class="xs primary" onclick="tasksInvite('${esc(id)}','generate')">生成邀请码</button>`
-          : `<button class="xs" onclick="openAddAccount('cookie')">更新登录态</button>`}
-        <button class="xs" onclick="TASK_INV.tried='';tasksInvite('${esc(id)}')">重试</button>
-      </div>
-      ${rc ? inviteRules(rc) : `<p class="hint" style="margin-top:12px">奖励规则要等登录态有效后才能读到。</p>`}
-    </div>`;
-  } else {
-    body = `<div class="pad">
-      <div class="hint" style="margin-bottom:2px">专属邀请链接（好友注册后到账，双方各得 ${nf(rc ? rc.register_inviter : 5000)} 分）</div>
+      ${TASK_INV.err ? `<div class="state" style="margin-bottom:10px;color:var(--warn)"><span class="pulse warn"></span><span>${esc(TASK_INV.err)} —— 链接与规则可用，统计数字暂不可读</span></div>` : ""}
+      <div class="hint" style="margin-bottom:2px">专属邀请链接${rc ? `（好友注册后到账，双方各得 ${nf(rc.register_inviter)} 分）` : ""}</div>
       <div class="url" id="invLink">${esc(card.link)}</div>
       <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px">
         <button class="xs primary" onclick="taskCopy(document.getElementById('invLink').textContent,'邀请链接已复制')">复制链接</button>
         ${card.code ? `<button class="xs" onclick="taskCopy(document.getElementById('invCode').textContent,'邀请码已复制')">复制邀请码 ${esc(card.code)}</button><span id="invCode" hidden>${esc(card.code)}</span>` : ""}
         ${card.expires_at ? `<span class="hint" style="align-self:center">有效期至 ${esc(String(card.expires_at).slice(0, 10))}</span>` : ""}
+        ${stale ? `<span class="hint" style="align-self:center">本地保存于 ${esc(ago(card.cached_at))}</span>` : ""}
       </div>
       ${st ? `<div class="stats" style="margin-bottom:14px">
         <div class="stat"><div class="v">${nf(st.registered)}</div><div class="k">已注册人数</div></div>
         <div class="stat"><div class="v">${nf(st.subscribed)}</div><div class="k">已订阅人数</div></div>
         <div class="stat hl"><div class="v">${nf(st.earned)}</div><div class="k">已获得积分</div></div>
         ${st.risk_pending ? `<div class="stat warn"><div class="v">${nf(st.risk_pending)}</div><div class="k">风控待补发</div></div>` : ""}
-      </div>` : ""}
+      </div>` : `<p class="hint" style="margin-bottom:14px">已注册 / 已订阅 / 已获得积分 需要有效登录态才能读。</p>`}
+      ${rc ? inviteRules(rc) : ""}
+    </div>`;
+  } else {
+    body = `<div class="pad">
+      <div class="state bad" style="margin-bottom:10px"><span class="pulse bad"></span><span>${esc(TASK_INV.err || "还没有邀请码")}</span></div>
+      <p class="hint" style="margin-bottom:12px">读邀请码只有登录态一条路，所以两种办法二选一，任选其一链接立刻可用：</p>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px">
+        ${row.cookie_ok ? `<button class="xs primary" onclick="tasksInvite('${esc(id)}','generate')">在线生成邀请码</button>` : `<button class="xs" onclick="openAddAccount('cookie')">更新登录态后自动读取</button>`}
+        <button class="xs" onclick="TASK_INV.tried='';tasksInvite('${esc(id)}')">重试</button>
+      </div>
       ${rc ? inviteRules(rc) : ""}
     </div>`;
   }
@@ -1523,14 +1530,38 @@ function viewInvite() {
   return `
   <div class="box">
     <header>
-      <h3>邀请赚积分<span class="hint">链接形如 https://meoo.com/?inviteCode=…</span></h3>
+      <h3>邀请赚积分<span class="hint">链接 = https://meoo.com/?inviteCode=&lt;邀请码&gt;</span></h3>
       <span class="grow"></span>
-      <select class="xs" onchange="TASK_INV.tried='';tasksInvite(this.value)">${opts}</select>
+      <select class="xs" onchange="TASK_INV.tried='';TASK_INV.draft=null;tasksInvite(this.value)">${opts}</select>
       <button class="xs" onclick="TASK_INV.tried='';tasksInvite(curInviteId())">刷新</button>
     </header>
     ${body}
-    <div class="foot"><span class="hint">邀请码与统计也走网页登录态；换账号切换上方下拉即可。仅个人版账号能裂变。</span></div>
+    <div class="foot" style="flex-wrap:wrap">
+      <span class="hint">邀请码</span>
+      <input id="invCodeInput" style="width:170px" placeholder="如 AB12CD34" value="${esc(draft)}" oninput="TASK_INV.draft=this.value"
+        onkeydown="if(event.key==='Enter')tasksSetCode('${esc(id)}')">
+      <button onclick="tasksSetCode('${esc(id)}')">保存并生成链接</button>
+      <span class="grow"></span>
+      <span class="hint">填一次就记住，Cookie 过期也不影响复制链接</span>
+    </div>
   </div>`;
+}
+
+async function tasksSetCode(id) {
+  const code = String(TASK_INV.draft != null ? TASK_INV.draft : "").trim();
+  if (!code) { toast("先填邀请码", "bad"); return; }
+  TASK_INV.busy = true; TASK_INV.err = "";
+  if (view === "tasks") render();
+  try {
+    const r = await api("/admin/api/tasks/invite", { method: "POST", body: JSON.stringify({ id, action: "set", code }) });
+    TASK_INV.busy = false;
+    if (!r || !r.ok) TASK_INV.err = (r && r.error) || "保存失败";
+    else {
+      TASK_INV.card = r.card; TASK_INV.err = ""; TASK_INV.tried = id; TASK_INV.draft = null;
+      toast("邀请码已保存，链接已生成");
+    }
+  } catch (e) { TASK_INV.busy = false; TASK_INV.err = e.message; }
+  if (view === "tasks") render();
 }
 
 function inviteRules(rc) {

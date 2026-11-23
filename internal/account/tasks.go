@@ -463,15 +463,15 @@ func (s *Service) TaskOverview(ctx context.Context) []TaskRow {
 func (s *Service) InviteCard(ctx context.Context, accountID string) (map[string]any, error) {
 	cookie, err := s.accountCookie(accountID)
 	if err != nil {
-		return nil, err
+		// 连 Cookie 都没有：本地存过的码照样要能用
+		return s.inviteFallback(ctx, accountID), err
 	}
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	// 先确认真的是登录态：匿名请求 myCard 也返回 200（code/stats 全 null），
 	// 不先判定就会把"掉线"显示成"还没生成邀请码"。
 	if ok, msg := s.webLoginOK(ctx, cookie); !ok {
-		// 规则是公开的：掉线时也带回去，用户至少知道这条链接值不值得修。
-		return s.anonRules(ctx), fmt.Errorf("%s", msg)
+		return s.inviteFallback(ctx, accountID), fmt.Errorf("%s", msg)
 	}
 	code, raw, err := s.webCall(ctx, cookie, http.MethodGet, inviteCardPath, nil)
 	if err != nil {
@@ -485,7 +485,12 @@ func (s *Service) InviteCard(ctx context.Context, accountID string) (map[string]
 	if code != 200 {
 		return nil, fmt.Errorf("读取邀请信息失败 HTTP %d %s", code, strings.TrimSpace(rep.message()))
 	}
-	return s.inviteView(rep.payload())
+	card, err := s.inviteView(rep.payload())
+	if err != nil {
+		return nil, err
+	}
+	s.saveInviteCode(accountID, str(card["code"]), str(card["expires_at"]))
+	return card, nil
 }
 
 // InviteGenerate 生成邀请码（账号还没有专属邀请码时用）。
@@ -513,6 +518,7 @@ func (s *Service) InviteGenerate(ctx context.Context, accountID string) (map[str
 	if err != nil {
 		return nil, err
 	}
+	s.saveInviteCode(accountID, str(out["code"]), str(out["expires_at"]))
 	if _, ok := out["code"]; ok {
 		if card, cerr := s.InviteCard(ctx, accountID); cerr == nil {
 			for k, v := range card {
@@ -589,6 +595,108 @@ func (s *Service) inviteView(payload json.RawMessage) (map[string]any, error) {
 		}
 	}
 	return out, nil
+}
+
+// inviteLink 邀请链接就是站点首页 + inviteCode，前端 kQ() 也是这么拼的。
+func (s *Service) inviteLink(code string) string {
+	return s.base() + "/?inviteCode=" + code
+}
+
+// inviteFallback 是掉线时的降级卡：按「链接、统计、规则」三层来分。
+// 链接只需要一个码（本地就有），规则是公开的，只有统计必须登录态 ——
+// 别让一个过期 Cookie 把整张邀请卡打空。
+func (s *Service) inviteFallback(ctx context.Context, accountID string) map[string]any {
+	out := s.anonRules(ctx)
+	if out == nil {
+		out = map[string]any{}
+	}
+	for k, v := range s.cachedInvite(accountID) {
+		out[k] = v
+	}
+	return out
+}
+
+// cachedInvite 返回本地记住的邀请码。stale=true 表示这份没有登录态刷新过，
+// 只有码和链接可信，统计数字不可信。
+func (s *Service) cachedInvite(accountID string) map[string]any {
+	s.St.Mu.RLock()
+	defer s.St.Mu.RUnlock()
+	for _, a := range s.St.Data.Accounts {
+		if a.ID == accountID && strings.TrimSpace(a.InviteCode) != "" {
+			return map[string]any{
+				"code": a.InviteCode, "link": s.inviteLink(a.InviteCode),
+				"expires_at": a.InviteExpAt, "cached_at": a.InviteCodeAt, "stale": true,
+			}
+		}
+	}
+	return nil
+}
+
+// saveInviteCode 把上游给的邀请码记下来；空码不覆盖已有值。
+func (s *Service) saveInviteCode(accountID, code, expiresAt string) {
+	code = strings.TrimSpace(code)
+	if code == "" {
+		return
+	}
+	s.St.Mu.Lock()
+	if a := s.findLocked(accountID); a != nil {
+		a.InviteCode = code
+		a.InviteExpAt = expiresAt
+		a.InviteCodeAt = model.NowMilli()
+	}
+	s.St.Mu.Unlock()
+	s.St.Touch()
+}
+
+// SetInviteCode 手工写入邀请码。
+//
+// 存在的理由不是偷懒：读邀请码只有登录态一条路（实测项目 AK 读 /api/v1/user/me
+// 也只是 data:null），Cookie 一过期就彻底读不到。而链接本身不需要鉴权，
+// 所以允许人工填一次，换来的是一张永远能复制的邀请卡。
+func (s *Service) SetInviteCode(ctx context.Context, accountID, code string) (map[string]any, error) {
+	code = strings.TrimSpace(code)
+	if !validInviteCode(code) {
+		return nil, fmt.Errorf("邀请码应为 4~32 位字母或数字")
+	}
+	s.St.Mu.RLock()
+	found := false
+	for _, a := range s.St.Data.Accounts {
+		if a.ID == accountID {
+			found = true
+			break
+		}
+	}
+	s.St.Mu.RUnlock()
+	if !found {
+		return nil, fmt.Errorf("账号不存在")
+	}
+	s.saveInviteCode(accountID, code, "")
+	out := map[string]any{"code": code, "link": s.inviteLink(code), "manual": true}
+	for k, v := range s.anonRules(ctx) {
+		if _, ok := out[k]; !ok {
+			out[k] = v
+		}
+	}
+	return out, nil
+}
+
+// validInviteCode 上游码是 8 位 base62，这里放宽到 4~32 位，只挡明显的手滑。
+func validInviteCode(code string) bool {
+	if len(code) < 4 || len(code) > 32 {
+		return false
+	}
+	for _, r := range code {
+		if !(r >= '0' && r <= '9' || r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z') {
+			return false
+		}
+	}
+	return true
+}
+
+// str 把 map 里的 any 安全转成字符串（inviteView 的字段都是 string，但取的时候是 any）。
+func str(v any) string {
+	s, _ := v.(string)
+	return s
 }
 
 func (s *Service) accountCookie(accountID string) (string, error) {

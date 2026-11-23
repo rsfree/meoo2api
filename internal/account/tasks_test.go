@@ -251,3 +251,100 @@ func TestParseHM(t *testing.T) {
 		}
 	}
 }
+
+func TestValidInviteCode(t *testing.T) {
+	cases := map[string]bool{
+		"WkqDpEhL": true, "ab12": true, "AB12CD34": true,
+		"abc": false, "": false, "WkqDpEhL!": false, "空格 码": false,
+	}
+	for in, want := range cases {
+		if got := validInviteCode(in); got != want {
+			t.Fatalf("validInviteCode(%q) = %v, want %v", in, got, want)
+		}
+	}
+}
+
+func TestSetInviteCodeBuildsLink(t *testing.T) {
+	svc, hits := newTaskSvc(t, true, true, true)
+	card, err := svc.SetInviteCode(context.Background(), "a_1", "  WkqDpEhL  ")
+	if err != nil {
+		t.Fatalf("手工设置失败: %v", err)
+	}
+	if card["code"] != "WkqDpEhL" || !strings.HasSuffix(card["link"].(string), "/?inviteCode=WkqDpEhL") {
+		t.Fatalf("链接拼接不对: %v", card)
+	}
+	if *hits != 0 {
+		t.Fatal("手工设码不该打上游")
+	}
+	svc.St.Mu.RLock()
+	defer svc.St.Mu.RUnlock()
+	if svc.St.Data.Accounts[0].InviteCode != "WkqDpEhL" {
+		t.Fatal("邀请码未落盘")
+	}
+}
+
+func TestSetInviteCodeRejectsBadCode(t *testing.T) {
+	svc, _ := newTaskSvc(t, true, true, true)
+	if _, err := svc.SetInviteCode(context.Background(), "a_1", "no way"); err == nil {
+		t.Fatal("非法邀请码必须拒绝")
+	}
+	if _, err := svc.SetInviteCode(context.Background(), "missing", "WkqDpEhL"); err == nil {
+		t.Fatal("不存在的账号必须报错")
+	}
+}
+
+// 掉线 + 本地有码 = 仍然要能复制链接，只是没有统计。
+func TestInviteCardFallsBackToCachedCode(t *testing.T) {
+	svc, _ := newTaskSvc(t, false, false, false)
+	if _, err := svc.SetInviteCode(context.Background(), "a_1", "WkqDpEhL"); err != nil {
+		t.Fatalf("预置邀请码失败: %v", err)
+	}
+	card, err := svc.InviteCard(context.Background(), "a_1")
+	if err == nil {
+		t.Fatal("掉线仍应返回错误提示")
+	}
+	if card == nil {
+		t.Fatal("应回落到本地邀请码，实际为空")
+	}
+	if link, _ := card["link"].(string); !strings.HasSuffix(link, "/?inviteCode=WkqDpEhL") {
+		t.Fatalf("链接应回落到本地邀请码: %v", card)
+	}
+	if card["stale"] != true {
+		t.Fatalf("应标记为未刷新: %v", card)
+	}
+	if _, has := card["stats"]; has {
+		t.Fatal("掉线不该编造统计数字")
+	}
+}
+
+// 上线后拿到码要落盘：否则下一次 Cookie 过期又会退回"没有邀请码"。
+func TestInviteCardCachesUpstreamCode(t *testing.T) {
+	svc, _ := newTaskSvc(t, true, true, true)
+	if _, err := svc.InviteCard(context.Background(), "a_1"); err != nil {
+		t.Fatalf("读邀请卡失败: %v", err)
+	}
+	svc.St.Mu.RLock()
+	defer svc.St.Mu.RUnlock()
+	a := svc.St.Data.Accounts[0]
+	if a.InviteCode != "AB12CD34" || a.InviteExpAt == "" || a.InviteCodeAt == 0 {
+		t.Fatalf("上游邀请码未缓存: %+v", a)
+	}
+}
+
+// 连 Cookie 都没有的号，只要本地存过码，邀请卡也不该是空的。
+func TestInviteCardFallsBackWithoutCookie(t *testing.T) {
+	svc, _ := newTaskSvc(t, true, true, true)
+	if _, err := svc.SetInviteCode(context.Background(), "a_1", "WkqDpEhL"); err != nil {
+		t.Fatalf("预置邀请码失败: %v", err)
+	}
+	svc.St.Mu.Lock()
+	svc.St.Data.Accounts[0].Cookie = ""
+	svc.St.Mu.Unlock()
+	card, err := svc.InviteCard(context.Background(), "a_1")
+	if err == nil || !strings.Contains(err.Error(), "Cookie") {
+		t.Fatalf("无 Cookie 应给出接入提示: %v", err)
+	}
+	if link, _ := card["link"].(string); !strings.HasSuffix(link, "/?inviteCode=WkqDpEhL") {
+		t.Fatalf("应回落到本地邀请码: %v", card)
+	}
+}
