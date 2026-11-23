@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"net/url"
 	"strings"
@@ -723,6 +724,7 @@ func (s *Service) AttachFromCookie(ctx context.Context, cookie, label string) (m
 		if err := s.St.Save(); err != nil {
 			return nil, err
 		}
+		s.onboardAfterAttach(existingID)
 		return map[string]any{"account_id": existingID, "user_id": userID, "name": name, "cookie_only": true}, nil
 	}
 
@@ -792,7 +794,32 @@ func (s *Service) AttachFromCookie(ctx context.Context, cookie, label string) (m
 	if err := s.St.Save(); err != nil {
 		return nil, err
 	}
+	s.onboardAfterAttach(accID)
 	return map[string]any{"account_id": accID, "user_id": userID, "name": name, "project_id": pid}, nil
+}
+
+// onboardAfterAttach 接入成功后异步补两件"白拿积分"的事，不阻塞接入响应：
+//   - 领当日登录积分：需网页 Cookie，上游幂等（今天领过记 already，不算失败）
+//   - 把自己的邀请码落库：前端建登录会话时取"第一个有码的账号"当邀请人，
+//     新号自己没码，就永远只有老号能当种子
+//
+// 只对有 Cookie 的路径有效：设备授权只落 AK，而 entitlement/init 对 AK 一律
+// 403 API_KEY_ROUTE_FORBIDDEN，根本签不了到。
+func (s *Service) onboardAfterAttach(accountID string) {
+	if accountID == "" {
+		return
+	}
+	go func() {
+		// 必须用 Background：请求 ctx 在响应返回后立刻取消，异步任务会被打断。
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		if res := s.Checkin(ctx, accountID); !res.OK {
+			log.Printf("接入后自动签到未成功 account=%s: %s", accountID, res.Error)
+		}
+		if _, err := s.InviteCard(ctx, accountID); err != nil {
+			log.Printf("接入后读取邀请码失败 account=%s: %v", accountID, err)
+		}
+	}()
 }
 
 // ---------------- 凭证巡检 ----------------
