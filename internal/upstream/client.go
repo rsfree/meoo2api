@@ -10,6 +10,8 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -22,8 +24,12 @@ const (
 	KindRate       = "rate"        // 429：限流
 	KindServer     = "server"      // 5xx：上游故障
 	KindBadRequest = "bad_request" // 400 等：请求本身有问题，换号无意义
-	KindNetwork    = "network"     // 连接失败 / 超时
-	KindCanceled   = "canceled"    // 客户端取消
+	KindNetwork    = "network"     // 连接失败
+	// KindTimeout 与 KindNetwork 分开：超时要按 504 暴露，而不是 502 connection。
+	// 之前 ctx 超时被归进 network，于是同一个 180 秒超时在运行日志里
+	// 时而 504（读 body 报 DeadlineExceeded）时而 502（channel 关闭无终态），同一件事两种语义。
+	KindTimeout  = "timeout"  // 连接已建但上游不回响应头 / 上下文超时
+	KindCanceled = "canceled" // 客户端取消
 )
 
 // Error 描述一次可分类的上游失败。
@@ -44,7 +50,7 @@ func (e *Error) Error() string {
 // Retryable 表示"换个账号同一请求可能成功"。
 func (e *Error) Retryable() bool {
 	switch e.Kind {
-	case KindQuota, KindAuth, KindRate, KindServer:
+	case KindQuota, KindAuth, KindRate, KindServer, KindTimeout:
 		return true
 	}
 	return false
@@ -77,6 +83,7 @@ func New(base string) *Client {
 		MaxIdleConnsPerHost:   32,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   15 * time.Second,
+		ResponseHeaderTimeout: headerTimeout(),
 		ExpectContinueTimeout: 3 * time.Second,
 		ForceAttemptHTTP2:     true,
 	}
@@ -165,9 +172,31 @@ func classifyNet(err error) error {
 		return &Error{Kind: KindCanceled, Message: "客户端取消"}
 	}
 	if errors.Is(err, context.DeadlineExceeded) {
-		return &Error{Kind: KindNetwork, Message: "上游超时"}
+		return &Error{Kind: KindTimeout, Message: "上游超时"}
+	}
+	// ResponseHeaderTimeout 触发的是 net.Error 的 Timeout，而不是 ctx 的
+	// DeadlineExceeded（ctx 可能还有余量）。不单独判的话会被当成普通连接失败，
+	// 一个「迟迟不给响应头」的上游会被报成 502 connection。
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		return &Error{Kind: KindTimeout, Message: "上游响应头超时"}
 	}
 	return &Error{Kind: KindNetwork, Message: err.Error()}
+}
+
+// headerTimeout 是「连接已建立、但上游迟迟不回响应头」的上限。
+//
+// 为什么需要它：实测上游在首字节前整段静默（qwen3.8-max 首字节 P50 12s、最坏 72s），
+// 且响应头与首帧数据几乎同时到达。没有这个上限时，一个卡死的上游只能靠 ctx 的
+// 180s 兜底——连接空占三分钟、积分白扣、客户端干等。
+// 调大不会让正常请求变慢，只是在更早的时刻把「确定卡死」判出来。
+func headerTimeout() time.Duration {
+	if v := strings.TrimSpace(os.Getenv("MEOO_HEADER_TIMEOUT_SEC")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return time.Duration(n) * time.Second
+		}
+	}
+	return 120 * time.Second
 }
 
 // parseBusinessEnvelope 识别 HTTP 200 的业务失败信封。

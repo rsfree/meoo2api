@@ -1203,6 +1203,9 @@ function viewConfig() {
         <label class="fld"><span class="lb">SSE 心跳间隔（秒）</span>
           <input id="cKeep" type="number" min="0" max="120" value="${c.keepalive_sec ?? 12}">
           <span class="hint">0 = 关闭</span></label>
+        <label class="fld"><span class="lb">首字节前提前发头（秒）</span>
+          <input id="cEarly" type="number" min="0" max="60" value="${c.early_header_sec ?? 8}">
+          <span class="hint">上游首字节前常静默十几秒，到点先发 200 + 心跳，避免客户端判超时挂断（499）。发头后本轮不能再换号；0 = 关闭</span></label>
         <label class="fld"><span class="lb">失败自动换号</span>
           <span style="display:flex;align-items:center;gap:8px;font-size:13px;color:var(--ink-2);padding:7px 0">
             <input id="cFailover" type="checkbox" ${c.failover ? "checked" : ""}> 仅限响应尚未开始发送时
@@ -1287,6 +1290,7 @@ async function saveConfig(btn, withPassword) {
         quota_cooldown_sec: Number($("#cQuota").value || 0),
         rate_cooldown_sec: Number($("#cRate").value || 0),
         keepalive_sec: Number($("#cKeep").value || 0),
+        early_header_sec: Number($("#cEarly").value || 0),
         failover: $("#cFailover").checked,
         checkin_auto: $("#cAuto").checked,
         checkin_time: ($("#cAutoAt").value || "").trim() || "09:00",

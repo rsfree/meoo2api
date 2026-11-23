@@ -323,7 +323,7 @@ func keyView(k *model.Key, now int64) map[string]any {
 	return map[string]any{
 		"id": k.ID, "key": model.Mask(k.Key), "project_id": k.ProjectID, "label": k.Label,
 		"provider": k.ProviderName(),
-		"enabled": k.Enabled, "state": k.Health.State, "reason": k.Health.Reason,
+		"enabled":  k.Enabled, "state": k.Health.State, "reason": k.Health.Reason,
 		"until": k.Health.Until, "cooldown_sec": cool,
 		"requests": k.Requests, "tokens": k.Tokens, "fails": k.Fails, "last_used": k.LastUsed,
 	}
@@ -870,6 +870,7 @@ func (h *Handler) configUpdate(w http.ResponseWriter, r *http.Request) {
 		RateCooldownSec   *int               `json:"rate_cooldown_sec"`
 		Failover          *bool              `json:"failover"`
 		KeepaliveSec      *int               `json:"keepalive_sec"`
+		EarlyHeaderSec    *int               `json:"early_header_sec"`
 		Aliases           *map[string]string `json:"aliases"`
 		AliasNotes        *map[string]string `json:"alias_notes"`
 		HiddenModels      *[]string          `json:"hidden_models"`
@@ -913,6 +914,18 @@ func (h *Handler) configUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 	if in.KeepaliveSec != nil && *in.KeepaliveSec >= 0 {
 		c.KeepaliveSec = *in.KeepaliveSec
+	}
+	// 0 = 关闭（旧行为：首字节前不写任何字节，保留换号能力）。
+	// 上限 60s：再大就超过大多数客户端的首字节超时，失去意义。
+	if in.EarlyHeaderSec != nil {
+		v := *in.EarlyHeaderSec
+		if v < 0 {
+			v = 0
+		}
+		if v > 60 {
+			v = 60
+		}
+		c.EarlyHeaderSec = v
 	}
 	if in.Aliases != nil {
 		m := map[string]string{}
@@ -1011,7 +1024,7 @@ func (h *Handler) test(w http.ResponseWriter, r *http.Request) {
 	}
 	key := h.Picker.Pick(map[string]bool{}, prov)
 	if key == nil {
-		writeErr(w, 503, "no_available_key", "号池中没有可用凭证（provider=" + prov + "）")
+		writeErr(w, 503, "no_available_key", "号池中没有可用凭证（provider="+prov+"）")
 		return
 	}
 	body := map[string]any{

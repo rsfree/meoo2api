@@ -4,9 +4,11 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"meoo2api/internal/model"
 	"meoo2api/internal/reqlog"
+	"meoo2api/internal/upstream"
 )
 
 // sse 写一组原始 SSE 帧并逐帧 flush，模拟上游的流式行为。
@@ -116,5 +118,92 @@ func TestStreamFirstFrameRateLimitFailsOver(t *testing.T) {
 	if h := healthOf(st, bad); h.State == "ok" {
 		// 被 429 的号至少要进过一次冷却
 		t.Logf("坏号状态 %+v（若从未被选中则跳过）", h)
+	}
+}
+
+// 上游在首字节前长时间静默（实测 qwen3.8-max 可达 72s，且全程不发任何注释帧）。
+// 旧实现里客户端这段时间既没有响应头也没有心跳，只能自己判超时挂断——线上 499 的主因。
+// 到 early_header_sec 必须先把 200 和心跳发出去。
+func TestStreamEarlyHeaderSendsKeepalive(t *testing.T) {
+	key := "meoo_project_k5555555555"
+	gw, f, st := harness(t, map[string]model.Health{key: {State: "ok"}})
+	st.Mu.Lock()
+	st.Data.Config.EarlyHeaderSec = 1
+	st.Data.Config.KeepaliveSec = 1
+	st.Mu.Unlock()
+
+	f.on(key, func(w http.ResponseWriter) {
+		time.Sleep(3 * time.Second) // 模拟首字节前的整段静默
+		sse(w, `data: {"choices":[{"delta":{"content":"好"},"finish_reason":"stop"}]}`+"\n\n", "data: [DONE]\n\n")
+	})
+
+	rec := chatReq(gw, streamBody)
+	body := rec.Body.String()
+	if rec.Code != 200 {
+		t.Fatalf("状态码应为 200，得到 %d", rec.Code)
+	}
+	if !strings.Contains(body, ": keepalive") {
+		t.Fatalf("首字节前必须已下发心跳，实际 body=%q", body)
+	}
+	if !strings.Contains(body, "好") {
+		t.Fatalf("内容必须正常转发，实际 body=%q", body)
+	}
+}
+
+// 发头之后上游才报错：状态码已不可改，必须用 error 帧收尾，
+// 不能让客户端拿到「200 然后静默断流」。
+func TestStreamEarlyHeaderErrorFrame(t *testing.T) {
+	key := "meoo_project_k6666666666"
+	gw, f, st := harness(t, map[string]model.Health{key: {State: "ok"}})
+	st.Mu.Lock()
+	st.Data.Config.EarlyHeaderSec = 1
+	st.Mu.Unlock()
+
+	f.on(key, func(w http.ResponseWriter) {
+		time.Sleep(2 * time.Second)
+		fail(w, 500, "server_error", "boom")
+	})
+
+	rec := chatReq(gw, streamBody)
+	body := rec.Body.String()
+	if rec.Code != 200 {
+		t.Fatalf("响应头已提前发出，状态码应为 200，得到 %d", rec.Code)
+	}
+	if !strings.Contains(body, "internal_error") || !strings.Contains(body, "[DONE]") {
+		t.Fatalf("发头后的错误必须以 error 帧 + [DONE] 收尾，实际 body=%q", body)
+	}
+}
+
+// 流中卡死到网关超时：必须记 504，不能折叠成 502 stream_interrupted。
+// 否则「上游卡住」和「客户端没耐心」在面板上完全无法区分（线上 9 次 502 与 4 次 504
+// 都精确卡在 180.00s，就是同一件事被记成两种语义）。
+func TestStreamTimeoutIsTimeoutNotInterrupted(t *testing.T) {
+	key := "meoo_project_k7777777777"
+	gw, f, st := harness(t, map[string]model.Health{key: {State: "ok"}})
+	st.Mu.Lock()
+	st.Data.Config.RequestTimeoutSec = 1
+	st.Data.Config.EarlyHeaderSec = 0 // 走未提前发头的路径
+	st.Mu.Unlock()
+
+	f.on(key, func(w http.ResponseWriter) {
+		sse(w, `data: {"choices":[{"delta":{"content":"开头"},"finish_reason":null}]}`+"\n\n")
+		time.Sleep(3 * time.Second) // 之后一个字节都不再发
+	})
+
+	rec := chatReq(gw, streamBody)
+	body := rec.Body.String()
+	if !strings.Contains(body, "upstream_timeout") {
+		t.Fatalf("超时必须报 504 upstream_timeout，实际 body=%q", body)
+	}
+	if strings.Contains(body, "stream_interrupted") {
+		t.Fatalf("超时不得折叠成 stream_interrupted，实际 body=%q", body)
+	}
+}
+
+// 超时错误必须按 504 暴露（KindTimeout），而不是 502 connection。
+func TestKindTimeoutSpec(t *testing.T) {
+	spec := specOf(&upstream.Error{Kind: upstream.KindTimeout})
+	if spec.Status != 504 || spec.Code != "upstream_timeout" {
+		t.Fatalf("KindTimeout 应映射 504/upstream_timeout，得到 %d/%s", spec.Status, spec.Code)
 	}
 }

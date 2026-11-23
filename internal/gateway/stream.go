@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -14,24 +15,126 @@ import (
 	"meoo2api/internal/upstream"
 )
 
-// proxyStream 把上游 SSE 逐帧转发给客户端，并在上游静默时补心跳。
-// 心跳与业务帧共用同一写路径（单 goroutine 主循环），不会把一帧劈成两半。
+// proxyStream 把上游 SSE 逐帧转发给客户端。
+//
+// 两条写路径约束：
+//   - 心跳与业务帧共用同一 goroutine（单写者），不会把一帧劈成两半；
+//   - 「提前发响应头」与正常收尾共用同一个 sendHeader，保证 200 只写一次。
+//
+// 为什么要提前发头：上游在首字节前整段静默（实测 qwen3.8-max 首字节 P50 12s、
+// 最坏 72s，且全程不发任何 SSE 注释帧），而响应头又被上游攒到首帧数据一起吐。
+// 旧实现里客户端在这段时间既收不到响应头也收不到心跳，只能自行判超时挂断——
+// 线上 499 全部落在这个窗口。代价是发头之后不能再换号，首帧错误只能以 error 帧告知，
+// 所以用一个可配的 early_header_sec 把这段「用重试能力换可见性」的权衡交给运维。
 func (h *Handler) proxyStream(ctx context.Context, w http.ResponseWriter, body map[string]any, key *model.Key,
 	resolved string, cl caller, r *http.Request, started time.Time, retried bool) error {
 
 	up := h.ClientFor(key)
-	resp, err := up.DoStream(ctx, up.Base+"/chat/completions", body, upstream.MergeHeader(key.Key, nil))
-	if err != nil {
-		ms := time.Since(started).Milliseconds()
-		h.logEntry(r, cl, key, resolved, statusOfErr(err), true, started, ms, ms, nil, err, retried)
-		return err
-	}
-	defer resp.Body.Close()
 
 	flusher, _ := w.(http.Flusher)
 	h.St.Mu.RLock()
 	keepSec := h.St.Data.Config.KeepaliveSec
+	earlySec := h.St.Data.Config.EarlyHeaderSec
 	h.St.Mu.RUnlock()
+
+	headerSent := false
+	sendHeader := func() {
+		if headerSent {
+			return
+		}
+		headerSent = true
+		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-cache, no-transform")
+		w.Header().Set("Connection", "keep-alive")
+		w.Header().Set("X-Accel-Buffering", "no")
+		w.WriteHeader(http.StatusOK)
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}
+	writeKeepalive := func() error {
+		if _, err := w.Write([]byte(": keepalive\n\n")); err != nil {
+			return err
+		}
+		if flusher != nil {
+			flusher.Flush()
+		}
+		return nil
+	}
+
+	// ticker 在函数级只建一次：「首字节前」与「转发中」两段等待共用，
+	// 分开建会漏 Stop（旧实现只有主循环那一个）。
+	var ticker *time.Ticker
+	var tick <-chan time.Time
+	if keepSec > 0 {
+		ticker = time.NewTicker(time.Duration(keepSec) * time.Second)
+		defer ticker.Stop()
+		tick = ticker.C
+	}
+
+	// 上游请求必须放到 goroutine：否则主 goroutine 在 DoStream 里阻塞，
+	// 首字节前那段静默期根本没有机会给客户端发东西。
+	type upResult struct {
+		resp *http.Response
+		err  error
+	}
+	resCh := make(chan upResult, 1)
+	go func() {
+		resp, err := up.DoStream(ctx, up.Base+"/chat/completions", body, upstream.MergeHeader(key.Key, nil))
+		resCh <- upResult{resp: resp, err: err}
+	}()
+
+	var early <-chan time.Time
+	if earlySec > 0 {
+		t := time.NewTimer(time.Duration(earlySec) * time.Second)
+		defer t.Stop()
+		early = t.C
+	}
+
+	var resp *http.Response
+	var err error
+	for resp == nil && err == nil {
+		select {
+		case res := <-resCh:
+			resp, err = res.resp, res.err
+		case <-early:
+			// 只触发一次：到点先发头 + 起心跳，让客户端知道「服务活着」。
+			early = nil
+			sendHeader()
+		case <-tick:
+			// 头没发就写会隐式提交 200，把换号机会吃掉——这句判断是保住重试能力的关键。
+			if !headerSent {
+				continue
+			}
+			if werr := writeKeepalive(); werr != nil {
+				ms := time.Since(started).Milliseconds()
+				h.logEntry(r, cl, key, resolved, 499, true, started, ms, ms, nil, nil, retried)
+				return nil
+			}
+		case <-ctx.Done():
+			err = ctx.Err()
+		}
+	}
+
+	if err != nil {
+		ms := time.Since(started).Milliseconds()
+		if !headerSent {
+			// 一个字节都没写过，仍可换号：原样交给上层决定。
+			h.logEntry(r, cl, key, resolved, statusOfErr(err), true, started, ms, ms, nil, err, retried)
+			return err
+		}
+		// 头已发出，状态码改不了；用 error 帧收尾，客户端至少能拿到明确原因，
+		// 而不是「200 然后连接静默断掉」。
+		spec := specOf(err)
+		_, _ = w.Write(sseErrorFrame(spec))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		if flusher != nil {
+			flusher.Flush()
+		}
+		h.logEntry(r, cl, key, resolved, spec.Status, true, started, ms, ms, nil, err, retried)
+		return nil
+	}
+	defer resp.Body.Close()
 
 	type line struct {
 		text string
@@ -58,32 +161,33 @@ func (h *Handler) proxyStream(ctx context.Context, w http.ResponseWriter, body m
 	}()
 
 	// 首帧探测：上游可能在 HTTP 200 之后直接吐 {"error":…}（内容过滤最常见）。
-	// 此时还没有写过任何字节，仍可换号重试。
+	// 此时还没有写过任何业务帧——未发头就仍可换号重试，已发头只能以 error 帧收尾。
 	var pending []string
-	headerSent := false
-	sendHeader := func() {
-		if headerSent {
-			return
-		}
-		headerSent = true
-		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
-		w.Header().Set("Cache-Control", "no-cache, no-transform")
-		w.Header().Set("Connection", "keep-alive")
-		w.Header().Set("X-Accel-Buffering", "no")
-		w.WriteHeader(http.StatusOK)
-		if flusher != nil {
-			flusher.Flush()
-		}
-	}
 	// fail 记一条日志再返回：首帧阶段失败时响应头还没发，chat() 若判定不可重试会
 	// 直接 failErr，之前这些请求（内容过滤、首帧限流）在运行日志里完全不存在。
 	fail := func(err error) error {
 		ms := time.Since(started).Milliseconds()
+		if headerSent {
+			spec := specOf(err)
+			_, _ = w.Write(sseErrorFrame(spec))
+			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+			if flusher != nil {
+				flusher.Flush()
+			}
+			h.logEntry(r, cl, key, resolved, spec.Status, true, started, ms, ms, nil, err, retried)
+			return nil
+		}
 		h.logEntry(r, cl, key, resolved, statusOfErr(err), true, started, ms, ms, nil, err, retried)
 		return err
 	}
 	for i := 0; i < 3; i++ {
-		ln, ok := <-ch
+		var ln line
+		var ok bool
+		select {
+		case ln, ok = <-ch:
+		case <-ctx.Done():
+			return fail(ctx.Err())
+		}
 		if !ok {
 			if len(pending) == 0 {
 				return fail(&upstream.Error{Kind: upstream.KindServer, Message: "上游在首帧前关闭连接"})
@@ -111,12 +215,6 @@ func (h *Handler) proxyStream(ctx context.Context, w http.ResponseWriter, body m
 		flusher.Flush()
 	}
 
-	var tick <-chan time.Time
-	if keepSec > 0 {
-		t := time.NewTicker(time.Duration(keepSec) * time.Second)
-		defer t.Stop()
-		tick = t.C
-	}
 	var u usage
 	var ttfb int64 = -1
 	gotFinish := false
@@ -124,23 +222,54 @@ func (h *Handler) proxyStream(ctx context.Context, w http.ResponseWriter, body m
 	contentLen, reasoningLen := 0, 0
 	lastFinish := ""
 
+	// closeOut 统一收尾日志：状态码必须是客户端真实收到/将要收到的语义。
+	closeOut := func(status int, ue *upstream.Error) {
+		ms := time.Since(started).Milliseconds()
+		h.logEntry(r, cl, key, resolved, status, true, started, ttfbOrZero(ttfb, started), ms, u, ue, retried)
+	}
+
 	for {
 		select {
-		case <-r.Context().Done():
-			// 客户端断开：直接结束，不把长度计入失败。
-			h.Picker.MarkOK(key.ID, resolved, u.total)
-			h.logEntry(r, cl, key, resolved, 499, true, started, ttfbOrZero(ttfb, started), time.Since(started).Milliseconds(), u, nil, retried)
-			return nil
-		case <-tick:
-			if _, werr := w.Write([]byte(": keepalive\n\n")); werr != nil {
+		case <-ctx.Done():
+			// 超时记 504、客户端断开记 499：两者若都折进 502 stream_interrupted，
+			// 「上游卡死」和「客户端没耐心」在面板上就长得一模一样。
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				spec := specs["timeout"]
+				_, _ = w.Write(sseErrorFrame(spec))
+				_, _ = w.Write([]byte("data: [DONE]\n\n"))
+				if flusher != nil {
+					flusher.Flush()
+				}
+				closeOut(spec.Status, &upstream.Error{Kind: upstream.KindTimeout, Message: "网关等待上游超时"})
 				return nil
 			}
-			if flusher != nil {
-				flusher.Flush()
+			h.Picker.MarkOK(key.ID, resolved, u.total)
+			closeOut(499, nil)
+			return nil
+		case <-tick:
+			if werr := writeKeepalive(); werr != nil {
+				closeOut(499, nil)
+				return nil
 			}
 		case ln, ok := <-ch:
 			if !ok {
 				h.Picker.MarkOK(key.ID, resolved, u.total)
+				// 先判 ctx，再判「上游没给终态」：ctx 到点是超时（504），
+				// 客户端断开是取消（499），只有上游自己结束却没给终态才是真正的 502。
+				if cerr := ctx.Err(); cerr != nil {
+					if errors.Is(cerr, context.DeadlineExceeded) {
+						spec := specs["timeout"]
+						_, _ = w.Write(sseErrorFrame(spec))
+						_, _ = w.Write([]byte("data: [DONE]\n\n"))
+						if flusher != nil {
+							flusher.Flush()
+						}
+						closeOut(spec.Status, &upstream.Error{Kind: upstream.KindTimeout, Message: "网关等待上游超时"})
+						return nil
+					}
+					closeOut(499, nil)
+					return nil
+				}
 				if !gotFinish {
 					// 上游没给 finish_reason。两种情况必须分开：
 					//
@@ -172,7 +301,7 @@ func (h *Handler) proxyStream(ctx context.Context, w http.ResponseWriter, body m
 					} else if contentLen == 0 && reasoningLen == 0 {
 						reason = "流无任何内容产出"
 					}
-					h.logEntry(r, cl, key, resolved, spec.Status, true, started, ttfbOrZero(ttfb, started), time.Since(started).Milliseconds(), u, &upstream.Error{Kind: upstream.KindServer, Message: reason}, retried)
+					closeOut(spec.Status, &upstream.Error{Kind: upstream.KindServer, Message: reason})
 					return nil
 				}
 				_, _ = w.Write([]byte("data: [DONE]\n\n"))
@@ -187,9 +316,22 @@ func (h *Handler) proxyStream(ctx context.Context, w http.ResponseWriter, body m
 				return nil
 			}
 			if ln.err != nil {
+				// 读错误同样先判 ctx：上游读超时与客户端取消的处置完全不同。
+				if cerr := ctx.Err(); cerr != nil {
+					if errors.Is(cerr, context.DeadlineExceeded) {
+						spec := specs["timeout"]
+						_, _ = w.Write(sseErrorFrame(spec))
+						_, _ = w.Write([]byte("data: [DONE]\n\n"))
+						if flusher != nil {
+							flusher.Flush()
+						}
+						closeOut(spec.Status, &upstream.Error{Kind: upstream.KindTimeout, Message: "网关等待上游超时"})
+						return nil
+					}
+				}
 				if statusOfErr(ln.err) == 499 {
 					// 客户端断开导致的读错误：写帧也没人收，只记账。
-					h.logEntry(r, cl, key, resolved, 499, true, started, ttfbOrZero(ttfb, started), time.Since(started).Milliseconds(), u, nil, retried)
+					closeOut(499, nil)
 					return nil
 				}
 				// 头已发出，状态码不可改：按契约补一帧公开 error，再 [DONE]。
@@ -199,7 +341,7 @@ func (h *Handler) proxyStream(ctx context.Context, w http.ResponseWriter, body m
 				if flusher != nil {
 					flusher.Flush()
 				}
-				h.logEntry(r, cl, key, resolved, spec.Status, true, started, ttfbOrZero(ttfb, started), time.Since(started).Milliseconds(), u, ln.err, retried)
+				closeOut(spec.Status, asUpstreamErr(ln.err))
 				return nil
 			}
 			if ttfb < 0 {
@@ -234,6 +376,15 @@ func (h *Handler) proxyStream(ctx context.Context, w http.ResponseWriter, body m
 			}
 		}
 	}
+}
+
+// asUpstreamErr 把任意读错误规整成 *upstream.Error，只用于日志。
+func asUpstreamErr(err error) *upstream.Error {
+	var ue *upstream.Error
+	if errors.As(err, &ue) {
+		return ue
+	}
+	return &upstream.Error{Kind: upstream.KindNetwork, Message: err.Error()}
 }
 
 // streamErrorOf 识别"HTTP 200 但首帧就是 error 对象"的上游形态。

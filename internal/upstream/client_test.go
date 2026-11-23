@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 func TestParseErrorClassification(t *testing.T) {
@@ -44,15 +46,48 @@ func TestParseErrorClassification(t *testing.T) {
 	}
 }
 
+// timeoutErr 模拟 ResponseHeaderTimeout 触发的 net.Error：
+// 它满足 net.Error 的 Timeout()，但不是 context.DeadlineExceeded。
+type timeoutErr struct{}
+
+func (timeoutErr) Error() string   { return "net/http: timeout awaiting response headers" }
+func (timeoutErr) Timeout() bool   { return true }
+func (timeoutErr) Temporary() bool { return true }
+
 func TestClassifyNet(t *testing.T) {
 	if ue, ok := classifyNet(context.Canceled).(*Error); !ok || ue.Kind != KindCanceled {
 		t.Fatalf("取消应归为 canceled，得到 %+v", classifyNet(context.Canceled))
 	}
-	if ue, ok := classifyNet(context.DeadlineExceeded).(*Error); !ok || ue.Kind != KindNetwork {
-		t.Fatalf("超时应归为 network")
+	// 超时必须单独归类：它要映射成 504，折进 network 会变成 502 connection。
+	if ue, ok := classifyNet(context.DeadlineExceeded).(*Error); !ok || ue.Kind != KindTimeout {
+		t.Fatalf("上下文超时应归为 timeout，得到 %+v", classifyNet(context.DeadlineExceeded))
+	}
+	if ue, ok := classifyNet(timeoutErr{}).(*Error); !ok || ue.Kind != KindTimeout {
+		t.Fatalf("响应头超时应归为 timeout，得到 %+v", classifyNet(timeoutErr{}))
 	}
 	if ue, ok := classifyNet(errors.New("dial tcp: refused")).(*Error); !ok || ue.Kind != KindNetwork {
 		t.Fatalf("连接失败应归为 network")
+	}
+}
+
+// ResponseHeaderTimeout：上游连接建好却迟迟不回响应头时，必须按「超时」收场，
+// 而不是干等到 ctx 的 180s，也不该被归成 502 connection。
+func TestResponseHeaderTimeout(t *testing.T) {
+	t.Setenv("MEOO_HEADER_TIMEOUT_SEC", "1")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(2 * time.Second)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL)
+	_, err := c.DoStream(context.Background(), srv.URL+"/x", map[string]any{"a": 1}, nil)
+	if err == nil {
+		t.Fatal("上游不回响应头应超时")
+	}
+	ue, ok := err.(*Error)
+	if !ok || ue.Kind != KindTimeout {
+		t.Fatalf("应归为 timeout，得到 %+v", err)
 	}
 }
 

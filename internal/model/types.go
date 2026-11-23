@@ -4,6 +4,7 @@ package model
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"strings"
 	"time"
 )
@@ -129,21 +130,47 @@ type ClientKey struct {
 
 // Config 是热生效的运行时配置。
 type Config struct {
-	DefaultMaxTokens  int               `json:"default_max_tokens"`  // -1 = 跟随上游；0 = 自动 4096；正数 = 指定值
-	RequestTimeoutSec int               `json:"request_timeout_sec"` // 默认 240
-	QuotaCooldownSec  int               `json:"quota_cooldown_sec"`  // 余额不足冷却，默认 1800
-	RateCooldownSec   int               `json:"rate_cooldown_sec"`   // 限流冷却，默认 600
-	Failover          bool              `json:"failover"`            // 自动换号
-	KeepaliveSec      int               `json:"keepalive_sec"`       // SSE 心跳间隔，0 关闭
-	Aliases           map[string]string `json:"aliases,omitempty"`
-	AliasNotes        map[string]string `json:"alias_notes,omitempty"` // 别名备注，仅面板展示用
-	HiddenModels      []string          `json:"hidden_models,omitempty"`
-	AdminPass         string            `json:"admin_pass,omitempty"` // pbkdf2 编码
+	DefaultMaxTokens  int  `json:"default_max_tokens"`  // -1 = 跟随上游；0 = 自动 4096；正数 = 指定值
+	RequestTimeoutSec int  `json:"request_timeout_sec"` // 默认 240
+	QuotaCooldownSec  int  `json:"quota_cooldown_sec"`  // 余额不足冷却，默认 1800
+	RateCooldownSec   int  `json:"rate_cooldown_sec"`   // 限流冷却，默认 600
+	Failover          bool `json:"failover"`            // 自动换号
+	KeepaliveSec      int  `json:"keepalive_sec"`       // SSE 心跳间隔，0 关闭
+	// EarlyHeaderSec：上游首字节前经常整段静默（实测 qwen3.8-max 首字节 P50 12s、最坏 72s，
+	// 且不发任何 SSE 注释帧），这段时间客户端既没有响应头也没有心跳，只能自行判超时挂断
+	// （线上 499 的主因）。超过这个秒数就先发 200 + SSE 头并开始心跳；0 = 关闭（旧行为）。
+	// 代价：发头之后不能再换号，首帧错误只能以 error 帧告知。
+	EarlyHeaderSec int               `json:"early_header_sec"`
+	Aliases        map[string]string `json:"aliases,omitempty"`
+	AliasNotes     map[string]string `json:"alias_notes,omitempty"` // 别名备注，仅面板展示用
+	HiddenModels   []string          `json:"hidden_models,omitempty"`
+	AdminPass      string            `json:"admin_pass,omitempty"` // pbkdf2 编码
 
 	// 每日自动签到：到点后用各账号的网页 Cookie 领登录赠送积分。
 	// 默认关闭——Cookie 有寿命（阿里 SSO ≤2 天），自动跑失败只会留一串错误。
 	CheckinAuto bool   `json:"checkin_auto"`
 	CheckinTime string `json:"checkin_time,omitempty"` // HH:MM，默认 09:00
+}
+
+// UnmarshalJSON 负责老配置文件的默认值补齐。
+//
+// early_header_sec 是后加的字段，老 data.json 里没有。如果只靠零值，
+// 「缺字段」和「显式设为 0（关闭）」会长得一模一样——升级后新行为永远不会生效。
+// 所以这里区分两者：字段缺失补默认值，显式给了 0 就尊重 0。
+func (c *Config) UnmarshalJSON(b []byte) error {
+	type plain Config
+	var p plain
+	if err := json.Unmarshal(b, &p); err != nil {
+		return err
+	}
+	*c = Config(p)
+	var probe struct {
+		EarlyHeaderSec *int `json:"early_header_sec"`
+	}
+	if json.Unmarshal(b, &probe) == nil && probe.EarlyHeaderSec == nil {
+		c.EarlyHeaderSec = DefaultConfig().EarlyHeaderSec
+	}
+	return nil
 }
 
 // Data 是整个状态树的根。
@@ -165,6 +192,7 @@ func DefaultConfig() Config {
 		RateCooldownSec:   600,
 		Failover:          true,
 		KeepaliveSec:      12,
+		EarlyHeaderSec:    8,
 		Aliases:           map[string]string{"qwen": "qwen3.8-flash", "ds": "deepseek-v4-flash-0731"},
 		CheckinTime:       "09:00",
 	}

@@ -258,6 +258,8 @@ func classify(err error) string {
 	}
 	// 5) 传输层
 	switch ue.Kind {
+	case upstream.KindTimeout:
+		return "timeout"
 	case upstream.KindCanceled:
 		return "stream_interrupted"
 	case upstream.KindNetwork:
