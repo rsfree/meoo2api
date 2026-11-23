@@ -2,6 +2,7 @@ package catalog
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -211,5 +212,64 @@ func TestEnrichFailureKeepsCatalog(t *testing.T) {
 	}
 	if errMsg, _ := s.Status()["meta_error"].(string); errMsg == "" {
 		t.Fatal("元数据失败必须记录 meta_error 供面板排查")
+	}
+}
+
+// TestMergeExtraDedupAndSort 守住补充模型的合并规则：去重、排序、上游已上报则以原条目为准。
+func TestMergeExtraDedupAndSort(t *testing.T) {
+	base := []Model{{ID: "glm-5.2", OwnedBy: "meoo"}}
+	got := mergeExtra(base, []string{"qwen3.6-plus", "glm-5.2", "", "MiniMax-M2.5"})
+	if len(got) != 3 {
+		t.Fatalf("应得 3 个（去重后），得到 %d: %+v", len(got), got)
+	}
+	if got[0].ID != "MiniMax-M2.5" || got[1].ID != "glm-5.2" || got[2].ID != "qwen3.6-plus" {
+		t.Fatalf("排序错误: %v", []string{got[0].ID, got[1].ID, got[2].ID})
+	}
+	if got[1].OwnedBy != "meoo" {
+		t.Fatalf("上游已上报的条目应保留原样，得到 %+v", got[1])
+	}
+	if got[0].OwnedBy != "meoo-extra" {
+		t.Fatalf("补充条目应标记 meoo-extra，得到 %+v", got[0])
+	}
+}
+
+// TestProbeExtraRejectsSilentFallback 上游对未知模型名会静默回落到默认模型并返回 200。
+// 这种「假可用」绝不能进目录 —— 否则客户端以为在用 A，实际是 B 在回答。
+func TestProbeExtraRejectsSilentFallback(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/chat/completions", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Model string `json:"model"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		actual := body.Model
+		if body.Model == "kimi-k2.5" { // 模拟静默回落
+			actual = "qwen3.8-flash"
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"model":"` + actual + `","choices":[{"message":{"content":"ok"}}]}`))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	st, _, _ := store.Load(t.TempDir())
+	defer st.Close()
+	st.Mu.Lock()
+	st.Data.Keys = []*model.Key{{ID: "k1", Key: "meoo_project_test", Enabled: true, Health: model.Health{State: "ok"}}}
+	st.Mu.Unlock()
+
+	up := upstream.New(srv.URL)
+	s := New(st, &pool.Picker{St: st, Up: up}, up)
+	s.Extra = []string{"glm-5", "kimi-k2.5"}
+	s.ProbeExtra(context.Background())
+
+	if len(s.extraOK) != 1 || s.extraOK[0] != "glm-5" {
+		t.Fatalf("只应放行回显一致的 glm-5，得到 %v", s.extraOK)
+	}
+	// 合并后目录里也不能出现它
+	for _, m := range mergeExtra(nil, s.extraOK) {
+		if m.ID == "kimi-k2.5" {
+			t.Fatal("静默回落的模型绝不能出现在目录里")
+		}
 	}
 }

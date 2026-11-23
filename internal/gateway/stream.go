@@ -19,7 +19,8 @@ import (
 func (h *Handler) proxyStream(ctx context.Context, w http.ResponseWriter, body map[string]any, key *model.Key,
 	resolved string, cl caller, r *http.Request, started time.Time, retried bool) error {
 
-	resp, err := h.Up.DoStream(ctx, h.Up.Base+"/chat/completions", body, upstream.MergeHeader(key.Key, nil))
+	up := h.ClientFor(key)
+	resp, err := up.DoStream(ctx, up.Base+"/chat/completions", body, upstream.MergeHeader(key.Key, nil))
 	if err != nil {
 		ms := time.Since(started).Milliseconds()
 		h.logEntry(r, cl, key, resolved, 0, true, started, ms, ms, nil, err, retried)

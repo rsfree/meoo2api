@@ -15,13 +15,23 @@ import (
 
 // Picker 是无状态选号器：状态全部来自 Store，进程重启不丢冷却。
 type Picker struct {
-	St *store.Store
-	Up *upstream.Client
+	St  *store.Store
+	Up  *upstream.Client    // 默认供应商客户端（兼容旧引用；等价 Reg.Get(DefaultProvider)）
+	Reg *upstream.Registry  // 全部供应商；nil 时视作只有 Up 一家
 
 	mu       sync.Mutex
 	rnd      *rand.Rand
 	last     map[string]int64 // keyID → 最近一次被选中时间
 	inflight map[string]int   // keyID → 在途请求数（负载均衡 + 防惊群）
+}
+
+// ClientFor 返回该凭证所属供应商的客户端。Reg 未接线时全部回退 Up，
+// 保证旧构造路径（测试、工具）不破。
+func (p *Picker) ClientFor(k *model.Key) *upstream.Client {
+	if p.Reg != nil && k != nil {
+		return p.Reg.Get(k.ProviderName())
+	}
+	return p.Up
 }
 
 // Usable 返回当前可用凭证（供面板与 /healthz 使用）。
@@ -62,8 +72,10 @@ func usableLocked(st *store.Store, k *model.Key, now int64) bool {
 }
 
 // Pick 选出一个凭证。exclude 是本请求已经尝试过的 keyID。
-func (p *Picker) Pick(exclude map[string]bool) *model.Key {
+// provider 非空时只在同名供应商的凭证里选（空 = 不限）。
+func (p *Picker) Pick(exclude map[string]bool, provider string) *model.Key {
 	now := model.NowMilli()
+	prov := model.NormalizeProvider(provider)
 	p.St.Mu.RLock()
 	type cand struct {
 		k     *model.Key
@@ -72,6 +84,9 @@ func (p *Picker) Pick(exclude map[string]bool) *model.Key {
 	var cands []cand
 	for _, k := range p.St.Data.Keys {
 		if exclude[k.ID] || !usableLocked(p.St, k, now) {
+			continue
+		}
+		if prov != "" && k.ProviderName() != prov {
 			continue
 		}
 		score := 1.0
@@ -130,8 +145,8 @@ func (p *Picker) Pick(exclude map[string]bool) *model.Key {
 
 // PickLeased 选号并占用一个在途名额；调用方必须在请求结束后 Release。
 // 与 Pick 分开，是为了让目录同步、面板探活这类短调用不占用并发配额。
-func (p *Picker) PickLeased(exclude map[string]bool) *model.Key {
-	k := p.Pick(exclude)
+func (p *Picker) PickLeased(exclude map[string]bool, provider string) *model.Key {
+	k := p.Pick(exclude, provider)
 	if k == nil {
 		return nil
 	}
@@ -248,10 +263,12 @@ func (p *Picker) Release(keyID string) {
 }
 
 // Probe 以 /models 探活：200 视为可用。不把 5xx/超时判死。
+// 各供应商探自己的 base——用 A 家的 key 打 B 家的 /models 毫无意义。
 func (p *Picker) Probe(ctx context.Context, k *model.Key) (bool, string) {
 	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
-	code, _, err := p.Up.DoJSON(ctx, "GET", p.Up.Base+"/models", nil, upstream.MergeHeader(k.Key, nil))
+	up := p.ClientFor(k)
+	code, _, err := up.DoJSON(ctx, "GET", up.Base+"/models", nil, upstream.MergeHeader(k.Key, nil))
 	if err == nil && code == 200 {
 		p.MarkOK(k.ID, "", 0)
 		return true, "ok"

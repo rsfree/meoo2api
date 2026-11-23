@@ -4,6 +4,7 @@ package catalog
 import (
 	"context"
 	"encoding/json"
+	"log"
 	"sort"
 	"strconv"
 	"strings"
@@ -42,6 +43,10 @@ type Service struct {
 	WebBase string
 	// RefreshEvery 是目录自动刷新周期；0 表示默认 5 分钟。
 	RefreshEvery time.Duration
+	// Extra 是上游 /models 没报、但实测能调的模型 ID（如 glm-5 / MiniMax-M2.5）。
+	// 必须经 ProbeExtra 验证回显一致才会并入目录 —— 上游对未知模型名会静默回落到
+	// 默认模型，不验证就等于把「假可用」放进目录。
+	Extra []string
 
 	mu       sync.RWMutex
 	models   []Model
@@ -50,6 +55,7 @@ type Service struct {
 	stale    bool
 	lastErr  string
 	webOnly  []string // 站点目录有、兼容网关没有的模型（仅面板提示，不可调用）
+	extraOK  []string // Extra 中验证通过（回显与请求一致）的模型
 	metaOK   int      // 本轮成功补到元数据的条数
 	metaAt   time.Time
 	metaErr  string
@@ -97,7 +103,7 @@ func (s *Service) Refresh(ctx context.Context) {
 	// 最多试 3 个不同凭证，避免单 key 故障导致目录长期不更新。
 	tried := map[string]bool{}
 	for i := 0; i < 3; i++ {
-		k := s.Picker.Pick(tried)
+		k := s.Picker.Pick(tried, model.DefaultProvider)
 		if k == nil {
 			break
 		}
@@ -118,6 +124,7 @@ func (s *Service) Refresh(ctx context.Context) {
 			continue
 		}
 		s.mu.Lock()
+		ms = mergeExtra(ms, s.extraOK)
 		s.models, s.defaultM, s.fetched, s.stale, s.lastErr = ms, def, time.Now(), false, ""
 		s.mu.Unlock()
 		// 元数据补全与主目录解耦：失败只记 metaErr，不影响可调用集合。
@@ -129,6 +136,81 @@ func (s *Service) Refresh(ctx context.Context) {
 		s.stale = true
 	}
 	s.mu.Unlock()
+}
+
+// mergeExtra 把已验证的补充模型并入目录，按 ID 去重（上游若开始自己上报，以原条目为准）。
+func mergeExtra(base []Model, extra []string) []Model {
+	if len(extra) == 0 {
+		return base
+	}
+	seen := make(map[string]bool, len(base))
+	for _, m := range base {
+		seen[m.ID] = true
+	}
+	out := base
+	for _, id := range extra {
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		out = append(out, Model{ID: id, Object: "model", OwnedBy: "meoo-extra"})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
+}
+
+// ProbeExtra 逐个验证 Extra 里的模型是否真的生效：
+// 发一个 max_tokens=1 的请求，只有响应 model 与请求 id 完全一致才算通过。
+//
+// 这一步不能省。上游对未知模型名并不总是报错 —— 实测 kimi-k2.5、deepseek-v3.2
+// 会直接静默回落到默认模型（qwen3.8-flash）并返回 200，客户端拿到的是另一个模型的
+// 回答还以为一切正常。宁可目录里少一个，也不能放进来一个假的。
+//
+// 成本：每个候选一次 1 token 请求，只在启动与手动刷新时跑。
+func (s *Service) ProbeExtra(ctx context.Context) {
+	if len(s.Extra) == 0 || s.Picker == nil {
+		return
+	}
+	ok := make([]string, 0, len(s.Extra))
+	for _, id := range s.Extra {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		k := s.Picker.Pick(nil, model.DefaultProvider)
+		if k == nil {
+			break
+		}
+		body := map[string]any{
+			"model": id, "messages": []map[string]string{{"role": "user", "content": "ping"}},
+			"max_tokens": 1, "stream": false,
+		}
+		cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 20*time.Second)
+		code, raw, err := s.Up.DoJSON(cctx, "POST", s.Up.Base+"/chat/completions", body, upstream.MergeHeader(k.Key, nil))
+		cancel()
+		if err != nil || code != 200 {
+			log.Printf("补充模型 %s 验证失败：%s", id, describe(code, err))
+			continue
+		}
+		var resp struct {
+			Model string `json:"model"`
+		}
+		if json.Unmarshal(raw, &resp) != nil {
+			log.Printf("补充模型 %s 验证失败：响应不是 JSON", id)
+			continue
+		}
+		if resp.Model != id {
+			log.Printf("补充模型 %s 验证失败：上游静默回落到 %s，不纳入目录", id, resp.Model)
+			continue
+		}
+		ok = append(ok, id)
+	}
+	s.mu.Lock()
+	s.extraOK = ok
+	s.mu.Unlock()
+	if len(ok) > 0 {
+		log.Printf("补充模型验证通过 %d/%d：%v", len(ok), len(s.Extra), ok)
+	}
 }
 
 // enrich 从 Meoo 站点目录补富元数据（context_window / max_tokens / multimodal / label / provider）。
@@ -464,8 +546,25 @@ func (s *Service) Status() map[string]any {
 		"source":        src,
 		"error":         s.lastErr,
 		"web_only":      webOnly,
+		"extra_ok":      append([]string(nil), s.extraOK...),
 		"meta_ok":       s.metaOK,
 		"meta_at":       metaAt,
 		"meta_error":    s.metaErr,
 	}
+}
+
+// ProviderOf 返回某上游模型 ID 所属的供应商；目录里没有时回退默认。
+// 这是「模型 → 上游」路由的唯一入口：别名请先过 Resolve 再进来。
+func (s *Service) ProviderOf(resolved string) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, m := range s.models {
+		if m.ID == resolved {
+			if p := model.NormalizeProvider(m.Provider); p != "" {
+				return p
+			}
+			break
+		}
+	}
+	return model.DefaultProvider
 }

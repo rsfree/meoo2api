@@ -36,6 +36,7 @@ Meoo 前端自己走的是 `/api/agent/start` + `/api/agent/query`（SSE）的 a
 | 方式 | 需要什么 | 适用 |
 |---|---|---|
 | **浏览器授权** | 点一次链接确认 | 常规；授权页偶发被 SPA 首页接走 |
+| **手机号登录** | 手机号 + 短信验证码，全程在面板里完成 | 有 sidecar 时最顺路；新号注册可带邀请码 |
 | **粘贴 Cookie** | 从浏览器复制一段 Cookie | 授权页渲染不出来时；或已有账号补登录态 |
 
 Cookie 方式的链路（全 HTTP，验证过）：
@@ -53,6 +54,33 @@ Cookie 是敏感凭证：只在面板登录后可提交，以 `0600` 存本地�
 
 ⚠️ 注意 Cookie 里的 `login_oneday_ticket` / `oneday_sid` 名字已经说明生命周期——**大约一天就会失效**。
 所以它适合"一次性接入"，不适合长期保活；账号的长期可用性靠个人 AK + 项目 AK，与 Cookie 无关。
+
+### 手机号远程登录（loginbrowser sidecar）
+
+面板「添加账号 → 手机号登录」：输入手机号 → 获取验证码 → 输入验证码 → 登录并接入。
+服务端真浏览器（chromedp）完成整个登录流程，密码与验证码只经 sidecar 内存，不落盘；
+登录成功后自动"换个人 AK → 建项目 → 开云 → 项目 AK 入池"，并立即销毁浏览器会话。
+
+- 邀请码归因：Meoo 前端没有独立 bind 接口，归因发生在登录落地后的
+  `GET /api/growth/invite/notifications?invite=<code>`（bundle 里 `Fut` 函数）。
+  sidecar 在 harvest 时于页面上下文原样复刻这次 fetch，新号注册即计入邀请（双方 +5000）。
+- 部署：sidecar 独立二进制（`loginbrowser/` 目录，自带 go.mod），只监听回环 `127.0.0.1:8792`。
+  主服务用 `LOGINBROWSER_URL` / `LOGINBROWSER_KEY` 指向它；未配置时面板不出现该入口。
+- 风控边界：`getcode` 一旦弹出图片验证码即阿里风控介入，必须人工识别——这一步没有自动化解法。
+
+### 多供应商（Provider）
+
+号池里的凭证按 `provider` 归属，网关按模型目录的 provider 字段把请求路由到对应上游。
+`provider=meoo` 的凭证是项目 AK；其他供应商粘贴其 API Key 即可（面板「凭证」页支持选择供应商）。
+
+```bash
+# 预注册其他供应商（逗号分隔，name=base）
+MEOO_PROVIDERS="deepseek=https://api.deepseek.com/v1,kimi=https://api.moonshot.cn/v1"
+```
+
+- 旧 `data.json` 里 provider 为空的凭证自动视为 meoo，**零迁移**。
+- 接入前提：上游必须兼容 OpenAI `/chat/completions` 协议；不兼容的先做适配层。
+- 供应商名只允许 `[a-z0-9_-]`，未注册的名字会被 keys/add 拒绝。
 
 ## 快速开始
 
@@ -216,6 +244,9 @@ AK 不会过期，所以哪怕 Cookie 已经死了，签到状态依然准确。
 | `MEOO_PROJECT_AK` | — | 首启预置一个项目 AK |
 | `MEOO2API_KEYS` | — | 首启预置客户端密钥，逗号分隔 |
 | `MEOO_WEB_BASE` | `https://meoo.com` | 富元数据目录所在站点（只补字段，不扩模型集合） |
+| `MEOO_PROVIDERS` | — | 额外供应商注册表，如 `deepseek=https://api.deepseek.com/v1` |
+| `LOGINBROWSER_URL` | — | 浏览器登录 sidecar 地址（默认关；配置后面板出现「手机号登录」） |
+| `LOGINBROWSER_KEY` | — | sidecar 的 `X-Login-Key`（sidecar 侧用 `LOGIN_KEY` 设置） |
 | `MEOO_METADATA` | `on` | 设 `off` 关闭元数据补全，目录退回纯 ID 列表 |
 | `MEOO_CATALOG_REFRESH_SEC` | `300` | 目录自动刷新周期（秒），最短 30；改完重启一次即生效 |
 

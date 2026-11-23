@@ -16,6 +16,10 @@ const (
 	PersonalAKPrefix = "meoo_ak_"
 	ProjectAKPrefix  = "meoo_project_"
 	ClientKeyPrefix  = "sk-"
+
+	// DefaultProvider 是默认上游供应商名。data.json 里 provider 为空的历史
+	// 凭证一律视为它——旧数据零迁移。
+	DefaultProvider = "meoo"
 )
 
 // Account 是一个 Meoo 身份。
@@ -79,12 +83,14 @@ type Health struct {
 	Failures int    `json:"failures,omitempty"`
 }
 
-// Key 是一个项目服务 AK（入池凭证）。
+// Key 是一个入池凭证。provider=meoo 时是项目服务 AK；其他 provider 时
+// 是该供应商的 API Key。凭证形态校验只对 meoo 生效。
 type Key struct {
 	ID        string `json:"id"`
 	Key       string `json:"key"`
 	AccountID string `json:"account_id"`
 	ProjectID string `json:"project_id"`
+	Provider  string `json:"provider,omitempty"` // 空 = DefaultProvider（兼容旧数据）
 	Label     string `json:"label,omitempty"`
 	Enabled   bool   `json:"enabled"`
 	Health    Health `json:"health"`
@@ -93,6 +99,19 @@ type Key struct {
 	Requests  int64  `json:"requests"`
 	Tokens    int64  `json:"tokens"`
 	Fails     int64  `json:"fails"`
+}
+
+// ProviderName 返回归一化的供应商名，空值回退默认。
+func (k *Key) ProviderName() string {
+	if s := NormalizeProvider(k.Provider); s != "" {
+		return s
+	}
+	return DefaultProvider
+}
+
+// NormalizeProvider 统一供应商名：小写、去空白。
+func NormalizeProvider(s string) string {
+	return strings.ToLower(strings.TrimSpace(s))
 }
 
 // ClientKey 是签发给客户端的 sk-…。

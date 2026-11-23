@@ -1,11 +1,15 @@
 package admin
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -25,9 +29,13 @@ type Handler struct {
 	Picker  *pool.Picker
 	Acc     *account.Service
 	Catalog *catalog.Service
-	Up      *upstream.Client
+	Up      *upstream.Client   // 默认（meoo）客户端
+	Reg     *upstream.Registry // 全部供应商；nil 时等价只有 Up
 	Log     *reqlog.Log
 	Start   time.Time
+
+	LBURL string // 浏览器登录 sidecar 地址（空 = 禁用该入口）
+	LBKey string // sidecar 的 X-Login-Key
 
 	Sessions   *Sessions
 	failMu     sync.Mutex
@@ -35,9 +43,9 @@ type Handler struct {
 }
 
 // New 构造管理端。
-func New(st *store.Store, pk *pool.Picker, acc *account.Service, cat *catalog.Service, up *upstream.Client, lg *reqlog.Log) *Handler {
+func New(st *store.Store, pk *pool.Picker, acc *account.Service, cat *catalog.Service, up *upstream.Client, reg *upstream.Registry, lg *reqlog.Log) *Handler {
 	return &Handler{
-		St: st, Picker: pk, Acc: acc, Catalog: cat, Up: up, Log: lg, Start: time.Now(),
+		St: st, Picker: pk, Acc: acc, Catalog: cat, Up: up, Reg: reg, Log: lg, Start: time.Now(),
 		Sessions: NewSessions(), loginFails: map[string]failState{},
 	}
 }
@@ -119,6 +127,14 @@ func (h *Handler) route(w http.ResponseWriter, r *http.Request, path string) boo
 		h.deviceAttach(w, r)
 	case path == "/admin/api/cookie/attach":
 		h.cookieAttach(w, r)
+	case path == "/admin/api/loginbrowser/session":
+		h.lbSession(w, r)
+	case path == "/admin/api/loginbrowser/action":
+		h.lbAction(w, r)
+	case path == "/admin/api/loginbrowser/state":
+		h.lbState(w, r)
+	case path == "/admin/api/loginbrowser/attach":
+		h.lbAttach(w, r)
 	case path == "/admin/api/account/refresh":
 		h.accountRefresh(w, r)
 	case path == "/admin/api/account/update":
@@ -145,7 +161,7 @@ func (h *Handler) route(w http.ResponseWriter, r *http.Request, path string) boo
 		h.Acc.SampleCost(r.Context())
 		writeJSON(w, 200, map[string]any{"ok": true})
 	case path == "/admin/api/catalog/refresh":
-		h.Catalog.Refresh(r.Context())
+		h.refreshCatalog(r.Context())
 		writeJSON(w, 200, map[string]any{"ok": true, "status": h.Catalog.Status()})
 	case path == "/admin/api/tasks/overview":
 		h.tasksOverview(w, r)
@@ -166,6 +182,10 @@ func (h *Handler) route(w http.ResponseWriter, r *http.Request, path string) boo
 func (h *Handler) state(w http.ResponseWriter, r *http.Request) {
 	now := model.NowMilli()
 	h.St.Mu.RLock()
+	provNames := []string{}
+	if h.Reg != nil {
+		provNames = h.Reg.Names()
+	}
 	accs := make([]map[string]any, 0, len(h.St.Data.Accounts))
 	for _, a := range h.St.Data.Accounts {
 		keys := make([]map[string]any, 0)
@@ -179,6 +199,7 @@ func (h *Handler) state(w http.ResponseWriter, r *http.Request) {
 			"id":   a.ID, "user_id": a.UserID, "name": a.Name, "label": a.Label,
 			"enabled": a.Enabled, "paused": a.Paused, "created_at": a.CreatedAt,
 			"personal_ak": model.Mask(a.PersonalAK), "has_personal_ak": a.PersonalAK != "",
+			"invite_code": a.InviteCode, "cookie_ok": a.Cookie != "",
 			"project_id": a.ProjectID, "points": a.Points, "points_at": a.PointsAt,
 			"last_error": a.LastError, "last_check_at": a.LastCheckAt, "check_ok": a.CheckOK,
 			"has_cookie": a.Cookie != "",
@@ -234,6 +255,8 @@ func (h *Handler) state(w http.ResponseWriter, r *http.Request) {
 			"status": h.Catalog.Status(), "stale": stale, "error": ferr,
 		},
 		"stats":      h.Log.Stats(),
+		"providers":  provNames,
+		"lb_ready":   h.lbReady(),
 		"usable":     len(h.Picker.Usable()),
 		"save_error": h.St.LastError(),
 	})
@@ -299,6 +322,7 @@ func keyView(k *model.Key, now int64) map[string]any {
 	}
 	return map[string]any{
 		"id": k.ID, "key": model.Mask(k.Key), "project_id": k.ProjectID, "label": k.Label,
+		"provider": k.ProviderName(),
 		"enabled": k.Enabled, "state": k.Health.State, "reason": k.Health.Reason,
 		"until": k.Health.Until, "cooldown_sec": cool,
 		"requests": k.Requests, "tokens": k.Tokens, "fails": k.Fails, "last_used": k.LastUsed,
@@ -341,7 +365,7 @@ func (h *Handler) deviceAttach(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]any{"ok": false, "error": err.Error(), "detail": out})
 		return
 	}
-	h.Catalog.Refresh(r.Context())
+	h.refreshCatalog(r.Context())
 	writeJSON(w, 200, map[string]any{"ok": true, "result": out})
 }
 
@@ -367,8 +391,170 @@ func (h *Handler) cookieAttach(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]any{"ok": false, "error": err.Error(), "detail": out})
 		return
 	}
-	h.Catalog.Refresh(r.Context())
+	h.refreshCatalog(r.Context())
 	writeJSON(w, 200, map[string]any{"ok": true, "result": out})
+}
+
+// ---------------- 远程浏览器登录（loginbrowser sidecar 代理） ----------------
+//
+// sidecar 只监听回环（127.0.0.1:8792），主服务代为转发并持有其密钥；
+// 面板永远不直连 sidecar。attach = harvest Cookie → AttachFromCookie，
+// 即"手机号登录一次，个人 AK → 项目 AK 全自动入池"。
+
+func (h *Handler) lbRequest(ctx context.Context, method, path string, body any) (int, []byte, error) {
+	u := strings.TrimRight(h.LBURL, "/") + path
+	var rdr io.Reader
+	if body != nil {
+		buf, err := json.Marshal(body)
+		if err != nil {
+			return 0, nil, err
+		}
+		rdr = bytes.NewReader(buf)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, u, rdr)
+	if err != nil {
+		return 0, nil, err
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	if h.LBKey != "" {
+		req.Header.Set("X-Login-Key", h.LBKey)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	return resp.StatusCode, raw, err
+}
+
+func (h *Handler) lbReady() bool { return strings.TrimSpace(h.LBURL) != "" }
+
+// refreshCatalog 目录服务是可选依赖（测试/降级场景可能为 nil），目录刷新失败不影响主流程。
+func (h *Handler) refreshCatalog(ctx context.Context) {
+	if h.Catalog == nil {
+		return
+	}
+	h.Catalog.Refresh(ctx)
+}
+
+func (h *Handler) lbSession(w http.ResponseWriter, r *http.Request) {
+	if !h.lbReady() {
+		writeErr(w, 503, "sidecar_disabled", "浏览器登录 sidecar 未配置（LOGINBROWSER_URL）")
+		return
+	}
+	var in struct {
+		Mode       string `json:"mode"`
+		InviteCode string `json:"invite_code"`
+	}
+	if err := decodeJSON(r, &in); err != nil {
+		writeErr(w, 400, "bad_request", "请求格式错误")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 40*time.Second)
+	defer cancel()
+	code, raw, err := h.lbRequest(ctx, http.MethodPost, "/v1/sessions", map[string]any{
+		"mode": in.Mode, "invite_code": in.InviteCode,
+	})
+	if err != nil {
+		writeErr(w, 502, "sidecar_unreachable", "sidecar 不可达: "+err.Error())
+		return
+	}
+	writeJSON(w, code, json.RawMessage(raw))
+}
+
+func (h *Handler) lbAction(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		ID    string `json:"id"`
+		Type  string `json:"type"`
+		Value string `json:"value"`
+	}
+	if err := decodeJSON(r, &in); err != nil || in.ID == "" {
+		writeErr(w, 400, "bad_request", "请求格式错误（需 id/type/value）")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 45*time.Second)
+	defer cancel()
+	code, raw, err := h.lbRequest(ctx, http.MethodPost, "/v1/sessions/"+url.PathEscape(in.ID)+"/action",
+		map[string]any{"type": in.Type, "value": in.Value})
+	if err != nil {
+		writeErr(w, 502, "sidecar_unreachable", "sidecar 不可达: "+err.Error())
+		return
+	}
+	writeJSON(w, code, json.RawMessage(raw))
+}
+
+func (h *Handler) lbState(w http.ResponseWriter, r *http.Request) {
+	id := r.URL.Query().Get("id")
+	if id == "" {
+		writeErr(w, 400, "bad_request", "缺少 id")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	defer cancel()
+	code, raw, err := h.lbRequest(ctx, http.MethodGet, "/v1/sessions/"+url.PathEscape(id)+"/state", nil)
+	if err != nil {
+		writeErr(w, 502, "sidecar_unreachable", "sidecar 不可达: "+err.Error())
+		return
+	}
+	writeJSON(w, code, json.RawMessage(raw))
+}
+
+// lbAttach 一步到位：harvest Cookie（含邀请归因）→ 换个人 AK → 建项目开云 → 项目 AK 入池。
+func (h *Handler) lbAttach(w http.ResponseWriter, r *http.Request) {
+	if !h.lbReady() {
+		writeErr(w, 503, "sidecar_disabled", "浏览器登录 sidecar 未配置（LOGINBROWSER_URL）")
+		return
+	}
+	var in struct {
+		ID    string `json:"id"`
+		Label string `json:"label"`
+	}
+	if err := decodeJSON(r, &in); err != nil || in.ID == "" {
+		writeErr(w, 400, "bad_request", "请求格式错误（需 id）")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 120*time.Second)
+	defer cancel()
+
+	code, raw, err := h.lbRequest(ctx, http.MethodPost, "/v1/sessions/"+url.PathEscape(in.ID)+"/harvest", nil)
+	if err != nil {
+		writeErr(w, 502, "sidecar_unreachable", "sidecar 不可达: "+err.Error())
+		return
+	}
+	var hv struct {
+		Ok      bool           `json:"ok"`
+		Cookies string         `json:"cookies"`
+		Error   string         `json:"error"`
+		Landing string         `json:"landing"`
+		Invite  map[string]any `json:"invite"`
+	}
+	if json.Unmarshal(raw, &hv) != nil || !hv.Ok || hv.Cookies == "" {
+		msg := hv.Error
+		if msg == "" {
+			msg = "harvest 失败（HTTP " + strconv.Itoa(code) + "）"
+		}
+		writeJSON(w, 200, map[string]any{"ok": false, "error": msg, "landing": hv.Landing, "invite": hv.Invite})
+		return
+	}
+
+	result, aerr := h.Acc.AttachFromCookie(ctx, hv.Cookies, in.Label)
+	out := map[string]any{"ok": aerr == nil, "invite": hv.Invite}
+	if aerr != nil {
+		out["error"] = aerr.Error()
+		out["detail"] = result
+		writeJSON(w, 200, out)
+		return
+	}
+	out["result"] = result
+	// Cookie 已被主服务以 0600 落盘，浏览器会话立即销毁，别留明文在内存里。
+	if _, _, derr := h.lbRequest(ctx, http.MethodDelete, "/v1/sessions/"+url.PathEscape(in.ID), nil); derr != nil {
+		log.Printf("sidecar 会话 %s 清理失败: %v", in.ID, derr)
+	}
+	h.refreshCatalog(r.Context())
+	writeJSON(w, 200, out)
 }
 
 // ---------------- 账号运维 ----------------
@@ -466,7 +652,7 @@ func (h *Handler) accountProject(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]any{"ok": false, "error": err.Error(), "project_id": pid})
 		return
 	}
-	h.Catalog.Refresh(r.Context())
+	h.refreshCatalog(r.Context())
 	writeJSON(w, 200, map[string]any{"ok": true, "project_id": pid, "key": model.Mask(ak)})
 }
 
@@ -494,19 +680,24 @@ func (h *Handler) accountRepair(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) keyAdd(w http.ResponseWriter, r *http.Request) {
 	var in struct {
-		Key   string `json:"key"`
-		Label string `json:"label"`
+		Key      string `json:"key"`
+		Label    string `json:"label"`
+		Provider string `json:"provider"` // 空 = meoo
 	}
 	if err := decodeJSON(r, &in); err != nil {
 		writeErr(w, 400, "bad_request", "请求格式错误")
 		return
 	}
-	k, err := h.Acc.AddProjectKey(r.Context(), in.Key, in.Label)
+	if p := model.NormalizeProvider(in.Provider); p != "" && p != model.DefaultProvider && h.Reg != nil && !h.Reg.Has(p) {
+		writeErr(w, 400, "unknown_provider", "未注册的供应商："+p+"（可用："+strings.Join(h.Reg.Names(), ", ")+"）")
+		return
+	}
+	k, err := h.Acc.AddProjectKey(r.Context(), in.Key, in.Label, in.Provider)
 	if err != nil {
 		writeErr(w, 400, "add_failed", err.Error())
 		return
 	}
-	h.Catalog.Refresh(r.Context())
+	h.refreshCatalog(r.Context())
 	writeJSON(w, 200, map[string]any{"ok": true, "id": k.ID})
 }
 
@@ -812,12 +1003,13 @@ func (h *Handler) test(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "empty_prompt", "请输入测试内容")
 		return
 	}
-	key := h.Picker.Pick(map[string]bool{})
+	mdl := h.Catalog.Resolve(in.Model)
+	prov := h.Catalog.ProviderOf(mdl)
+	key := h.Picker.Pick(map[string]bool{}, prov)
 	if key == nil {
-		writeErr(w, 503, "no_available_key", "号池中没有可用凭证")
+		writeErr(w, 503, "no_available_key", "号池中没有可用凭证（provider=" + prov + "）")
 		return
 	}
-	mdl := h.Catalog.Resolve(in.Model)
 	body := map[string]any{
 		"model": mdl, "stream": false,
 		"messages": []map[string]any{{"role": "user", "content": in.Prompt}},
@@ -828,7 +1020,8 @@ func (h *Handler) test(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 120*time.Second)
 	defer cancel()
 	started := time.Now()
-	code, raw, err := h.Up.DoJSON(ctx, http.MethodPost, h.Up.Base+"/chat/completions", body, upstream.MergeHeader(key.Key, nil))
+	up := h.Picker.ClientFor(key)
+	code, raw, err := up.DoJSON(ctx, http.MethodPost, up.Base+"/chat/completions", body, upstream.MergeHeader(key.Key, nil))
 	elapsed := time.Since(started).Milliseconds()
 	if err != nil {
 		if ue, ok := err.(*upstream.Error); ok && ue.Retryable() {

@@ -130,6 +130,27 @@ func run() error {
 
 	up := upstream.New(base)
 	defer up.HTTP.CloseIdleConnections()
+
+	// 多供应商注册表：meoo 恒为默认；其他供应商用
+	// MEOO_PROVIDERS="deepseek=https://api.deepseek.com/v1,kimi=https://..." 预注册。
+	// 号池里的凭证按 Key.Provider 归属，网关按模型目录的 provider 字段路由。
+	reg := upstream.NewRegistry(model.DefaultProvider, base)
+	if spec := strings.TrimSpace(env("MEOO_PROVIDERS", "")); spec != "" {
+		for _, item := range strings.Split(spec, ",") {
+			kv := strings.SplitN(item, "=", 2)
+			if len(kv) != 2 {
+				log.Printf("MEOO_PROVIDERS 忽略无效片段 %q（应为 name=base）", item)
+				continue
+			}
+			name, pbase := strings.TrimSpace(kv[0]), strings.TrimSpace(kv[1])
+			if reg.Add(name, pbase) == nil {
+				log.Printf("MEOO_PROVIDERS 忽略无效供应商 %q", item)
+				continue
+			}
+			log.Printf("已注册供应商 %s → %s", name, pbase)
+		}
+	}
+
 	lg, err := reqlog.Open(*dataDir)
 	if err != nil {
 		return fmt.Errorf("打开请求日志: %w", err)
@@ -137,7 +158,7 @@ func run() error {
 	defer lg.Close()
 
 	acc := &account.Service{St: st, Up: up}
-	pk := &pool.Picker{St: st, Up: up}
+	pk := &pool.Picker{St: st, Up: up, Reg: reg}
 	cat := catalog.New(st, pk, up)
 	// 富元数据目录：用项目 AK 读 Meoo 站点 /api/v1/agent/models，只给已上架模型补
 	// context_window / max_tokens / multimodal / label；不扩集合（硬白名单之外的调不通）。
@@ -145,15 +166,27 @@ func run() error {
 	if !strings.EqualFold(env("MEOO_METADATA", "on"), "off") {
 		cat.WebBase = strings.TrimRight(env("MEOO_WEB_BASE", "https://meoo.com"), "/")
 	}
+	// 上游 /models 没报、但实测能调的模型（逗号分隔）。启动时会逐个验证：
+	// 发 1 token 请求，只有响应回显的 model 与请求一致才纳入目录。
+	// 上游对未知名字会静默回落到默认模型，不验证就等于把「假可用」挂上去。
+	cat.Extra = splitList(env("MEOO_EXTRA_MODELS", "glm-5,MiniMax-M2.5,qwen3.6-plus"))
 	// 目录自动刷新周期（热更新）：默认 300 秒，改这个值不用重新编译。
 	if sec, cerr := strconv.Atoi(env("MEOO_CATALOG_REFRESH_SEC", "")); cerr == nil && sec > 0 {
 		cat.RefreshEvery = time.Duration(sec) * time.Second
 	}
-	gw := &gateway.Handler{St: st, Picker: pk, Catalog: cat, Up: up, Log: lg}
-	adm := admin.New(st, pk, acc, cat, up, lg)
+	gw := &gateway.Handler{St: st, Picker: pk, Catalog: cat, Up: up, Reg: reg, Log: lg}
+	adm := admin.New(st, pk, acc, cat, up, reg, lg)
+	// 远程浏览器登录 sidecar（loginbrowser）：只监听回环，由主服务代理转发。
+	// LOGINBROWSER_URL 为空时面板不出现「手机号登录」入口。
+	adm.LBURL = strings.TrimSpace(env("LOGINBROWSER_URL", ""))
+	adm.LBKey = env("LOGINBROWSER_KEY", "")
+	if adm.LBURL != "" {
+		log.Printf("浏览器登录 sidecar: %s", adm.LBURL)
+	}
 
 	// 先把模型目录同步一次再开监听：客户端第一眼拿到的就是真实目录。
 	syncCtx, syncCancel := context.WithTimeout(ctx, 15*time.Second)
+	cat.ProbeExtra(syncCtx) // 先验补充模型，Refresh 合并时才有 extraOK 可用
 	cat.Refresh(syncCtx)
 	syncCancel()
 	catalogDone := cat.Start(ctx)
@@ -285,7 +318,7 @@ func newHandler(gw *gateway.Handler, adm *admin.Handler) http.Handler {
 		case path == "/healthz":
 			writeJSON(w, 200, map[string]any{
 				"ok": true, "service": "meoo2api", "version": version,
-				"usable": len(gw.Picker.Usable()), "upstream": gw.Up.Base,
+				"usable": len(gw.Picker.Usable()), "upstream": gw.Up.Base, "providers": gw.Reg.Names(),
 			})
 		default:
 			if adm.ServeHTTP(w, r) {

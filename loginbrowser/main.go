@@ -7,6 +7,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -19,11 +20,12 @@ import (
 // 目标不是"复刻登录协议"，而是"让真浏览器把登录做完，我们只取 Cookie"。
 
 type session struct {
-	id      string
-	mode    string // sms | pwd
-	state   string
-	profile string
-	b       *browser
+	id         string
+	mode       string // sms | pwd
+	state      string
+	profile    string
+	b          *browser
+	inviteCode string // 非空时，登录落地后自动触发邀请归因
 
 	mu      sync.Mutex
 	created time.Time
@@ -149,7 +151,8 @@ func guard(key string, h http.HandlerFunc) http.HandlerFunc {
 
 func (m *manager) create(w http.ResponseWriter, r *http.Request) {
 	var in struct {
-		Mode string `json:"mode"`
+		Mode       string `json:"mode"`
+		InviteCode string `json:"invite_code"`
 	}
 	_ = json.NewDecoder(http.MaxBytesReader(w, r.Body, 8<<10)).Decode(&in)
 	mode := strings.ToLower(strings.TrimSpace(in.Mode))
@@ -179,6 +182,7 @@ func (m *manager) create(w http.ResponseWriter, r *http.Request) {
 
 	s := &session{
 		id: randState()[:16], mode: mode, state: randState(), profile: dir, b: b,
+		inviteCode: strings.TrimSpace(in.InviteCode),
 		created: time.Now(), lastUse: time.Now(), status: "starting",
 	}
 
@@ -367,12 +371,49 @@ func (m *manager) harvest(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 502, map[string]any{"ok": false, "id": s.id, "status": s.status, "error": err.Error(), "landing": landing})
 		return
 	}
+
+	// 邀请归因：Meoo 前端没有独立的 bind 接口，归因发生在
+	// GET /api/growth/invite/notifications?invite=<code>（bundle 里 Fut 函数，
+	// 登录成功落地后由 fromInvite 分支触发）。我们在页面上下文原样复刻这次
+	// fetch——同域 + credentials，等价于前端自己的调用。
+	invite := map[string]any{"requested": false}
+	if code := s.inviteCode; code != "" {
+		invite["requested"] = true
+		u := meooOrigin + "/api/growth/invite/notifications?invite=" + url.QueryEscape(code)
+		expr := fmt.Sprintf(inviteFetchExpr, u)
+		out, ierr := s.b.evalAwait(expr, 10*time.Second)
+		if ierr != nil {
+			invite["ok"] = false
+			invite["error"] = ierr.Error()
+		} else {
+			invite["raw"] = out
+			var parsed struct {
+				Status int    `json:"status"`
+				Body   string `json:"body"`
+			}
+			if json.Unmarshal([]byte(out), &parsed) == nil {
+				invite["http"] = parsed.Status
+				invite["ok"] = parsed.Status == 200
+			}
+		}
+		log.Printf("会话 %s 邀请归因 code=%s 结果=%v", s.id, code, invite["ok"])
+	}
+
 	s.status, s.note = "harvested", "已拿到 meoo Cookie"
 	writeJSON(w, 200, map[string]any{
 		"ok": true, "id": s.id, "status": s.status, "landing": landing,
-		"cookies": cookies, "bytes": len(cookies),
+		"cookies": cookies, "bytes": len(cookies), "invite": invite,
 	})
 }
+
+// inviteFetchExpr 在页面上下文发起同域 fetch；模板里只注入完整 URL。
+const inviteFetchExpr = `(async () => {
+  try {
+    const r = await fetch(%q, {credentials: 'include'});
+    const t = await r.text();
+    return JSON.stringify({status: r.status, body: t.slice(0, 400)});
+  } catch (e) { return JSON.stringify({status: 0, body: 'fetch_error: ' + String(e)}); }
+})()`
 
 func (m *manager) drop(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")

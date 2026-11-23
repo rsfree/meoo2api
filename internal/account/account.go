@@ -495,6 +495,7 @@ func (s *Service) upsertKey(accountID, projectID, ak string) {
 	}
 	k := &model.Key{
 		ID: model.RandID("k_", 6), Key: ak, AccountID: accountID, ProjectID: projectID,
+		Provider: model.DefaultProvider,
 		Enabled: true, Health: model.Health{State: "ok"}, CreatedAt: now,
 	}
 	s.St.Data.Keys = append(s.St.Data.Keys, k)
@@ -503,11 +504,19 @@ func (s *Service) upsertKey(accountID, projectID, ak string) {
 	}
 }
 
-// AddProjectKey 手动粘贴项目 AK 入库（BYOK 或已有项目）。
-func (s *Service) AddProjectKey(ctx context.Context, ak, label string) (*model.Key, error) {
+// AddProjectKey 手动粘贴凭证入库：provider=meoo（或空）时粘贴项目 AK，
+// 其他 provider 粘贴该供应商的 API Key（形态不做 Meoo 前缀校验）。
+func (s *Service) AddProjectKey(ctx context.Context, ak, label, provider string) (*model.Key, error) {
 	ak = strings.TrimSpace(ak)
-	if !model.IsProjectAK(ak) {
-		return nil, fmt.Errorf("项目 AK 形态不合法（应以 %s 开头）", model.ProjectAKPrefix)
+	prov := model.NormalizeProvider(provider)
+	if prov == model.DefaultProvider || prov == "" {
+		prov = model.DefaultProvider
+		if !model.IsProjectAK(ak) {
+			return nil, fmt.Errorf("项目 AK 形态不合法（应以 %s 开头）", model.ProjectAKPrefix)
+		}
+	}
+	if strings.TrimSpace(label) == "" && prov != model.DefaultProvider {
+		label = prov
 	}
 	s.St.Mu.RLock()
 	for _, k := range s.St.Data.Keys {
@@ -519,6 +528,7 @@ func (s *Service) AddProjectKey(ctx context.Context, ak, label string) (*model.K
 	s.St.Mu.RUnlock()
 	k := &model.Key{
 		ID: model.RandID("k_", 6), Key: ak, Label: label, ProjectID: "-",
+		Provider: prov,
 		Enabled: true, Health: model.Health{State: "ok"}, CreatedAt: model.NowMilli(),
 	}
 	s.St.Mu.Lock()

@@ -25,8 +25,17 @@ type Handler struct {
 	St      *store.Store
 	Picker  *pool.Picker
 	Catalog *catalog.Service
-	Up      *upstream.Client
+	Up      *upstream.Client    // 默认（meoo）客户端；Reg 未接线时的兜底
+	Reg     *upstream.Registry  // 全部供应商；nil 时等价只有 Up
 	Log     *reqlog.Log
+}
+
+// ClientFor 返回该凭证所属供应商的客户端（模型→上游路由的出口）。
+func (h *Handler) ClientFor(k *model.Key) *upstream.Client {
+	if h.Reg != nil {
+		return h.Reg.Get(k.ProviderName())
+	}
+	return h.Up
 }
 
 // caller 描述调用方身份。
@@ -204,6 +213,8 @@ func (h *Handler) chat(w http.ResponseWriter, r *http.Request) {
 	}
 	reqModel, _ := body["model"].(string)
 	resolved := h.Catalog.Resolve(reqModel)
+	// 模型决定供应商：目录里的 provider 字段是「模型 → 上游」的唯一权威。
+	prov := h.Catalog.ProviderOf(resolved)
 	stream, _ := body["stream"].(bool)
 
 	h.St.Mu.RLock()
@@ -232,7 +243,7 @@ func (h *Handler) chat(w http.ResponseWriter, r *http.Request) {
 		if cl.BYOK != "" {
 			key = &model.Key{ID: "byok", Key: cl.BYOK, Label: "BYOK"}
 		} else {
-			key = h.Picker.PickLeased(tried)
+			key = h.Picker.PickLeased(tried, prov)
 			if key == nil {
 				if lastErr != nil {
 					break
@@ -286,7 +297,8 @@ func (h *Handler) safeToRetry(w http.ResponseWriter) bool {
 // proxyJSON 处理非流式请求。
 func (h *Handler) proxyJSON(ctx context.Context, w http.ResponseWriter, body map[string]any, key *model.Key,
 	resolved string, cl caller, r *http.Request, started time.Time, retried bool) error {
-	code, raw, err := h.Up.DoJSON(ctx, http.MethodPost, h.Up.Base+"/chat/completions", body, upstream.MergeHeader(key.Key, nil))
+	up := h.ClientFor(key)
+	code, raw, err := up.DoJSON(ctx, http.MethodPost, up.Base+"/chat/completions", body, upstream.MergeHeader(key.Key, nil))
 	if err != nil {
 		h.logEntry(r, cl, key, resolved, 0, false, started, time.Since(started).Milliseconds(), time.Since(started).Milliseconds(), nil, err, retried)
 		return err
