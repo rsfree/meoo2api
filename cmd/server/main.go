@@ -186,16 +186,22 @@ func run() error {
 
 	// 先把模型目录同步一次再开监听：客户端第一眼拿到的就是真实目录。
 	//
-	// 两件事必须各有独立预算。共用一个 15 秒预算时，ProbeExtra（串行验证 3 个
-	// 补充模型，实测吃掉 19 秒）会把预算耗尽，随后 Refresh 拿到的是一个已经
-	// deadline exceeded 的 ctx，直接返回 —— 目录空着启动，对外只剩两个本地别名，
-	// 而下次自动刷新要等 5 分钟。
-	probeCtx, probeCancel := context.WithTimeout(ctx, 20*time.Second)
-	cat.ProbeExtra(probeCtx) // 先验补充模型，Refresh 合并时才有 extraOK 可用
-	probeCancel()
+	// 这里只跑 Refresh。补充模型验证（ProbeExtra）挪到后台，理由有两条：
+	//   1. 它只是一份「额外名单」，验不过就少几个模型，不该挡着服务监听；
+	//   2. 上游抖动时 3 个并发请求会集体超时（实测 22:18 三个全超时，主目录只花 2 秒），
+	//      放在前台等于把启动时间绑死在上游的健康度上。
+	// 后台验完再补一次 Refresh，让通过验证的模型当轮就进目录，不用等 5 分钟。
 	syncCtx, syncCancel := context.WithTimeout(ctx, 25*time.Second)
 	cat.Refresh(syncCtx)
 	syncCancel()
+	go func() {
+		probeCtx, probeCancel := context.WithTimeout(ctx, 90*time.Second)
+		defer probeCancel()
+		cat.ProbeExtra(probeCtx)
+		rc, rcCancel := context.WithTimeout(ctx, 25*time.Second)
+		defer rcCancel()
+		cat.Refresh(rc)
+	}()
 	catalogDone := cat.Start(ctx)
 	healthDone := acc.HealthLoop(ctx, time.Hour)
 	costDone := acc.CostLoop(ctx, 5*time.Minute)
